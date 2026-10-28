@@ -22,8 +22,8 @@
     <RepositoryUrl>https://github.com/JohnCampionJr/terminal-shell-integration</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
-    <!-- NuGet's default excludes drop dotfiles from the package, and zsh's four startup files
-         are dotfiles. Without this the nuspec lists them and the archive lacks them. -->
+    <!-- NuGet's default excludes drop dotfiles from the package, and zsh's .zshenv is one.
+         Without this the nuspec lists it and the archive lacks it. -->
     <NoDefaultExcludes>true</NoDefaultExcludes>
     <!-- Local staging only; shiprig pushes to nuget.org from here. -->
     <PackageOutputPath>$(MSBuildThisFileDirectory)../../local-feed</PackageOutputPath>

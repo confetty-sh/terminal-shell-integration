@@ -6,6 +6,12 @@
     python3 tools/check-shell-integration.py bash
     python3 tools/check-shell-integration.py fish
     python3 tools/check-shell-integration.py pwsh
+    python3 tools/check-shell-integration.py zsh --scenario zsh-xdg
+    python3 tools/check-shell-integration.py --list
+
+A scenario runs the shell with a throwaway HOME holding a particular user configuration -- the
+setups that broke integration once, kept so they cannot quietly break it again. Without one, the
+shell reads the real HOME, which is what a user gets but not something CI can reproduce.
 
 Build the library first, so the scripts are in its output directory:
 
@@ -27,14 +33,94 @@ import os
 import pty
 import re
 import select
+import shutil
 import sys
+import tempfile
 import time
 
-SHELL = sys.argv[1] if len(sys.argv) > 1 else "zsh"
+# Each scenario: the shell it is for, the files to write under a throwaway HOME, any extra
+# arguments, and text the run's output must contain. A user hook that prints "hook-saw:$?" is
+# checked for seeing the status of the user's COMMAND, which is what integration must not disturb.
+SCENARIOS = {
+    # The four files, each reporting that it ran, in their default place.
+    "zsh-plain": ("zsh", {
+        ".zshenv": 'print -r -- "user-zshenv-ran"\n',
+        ".zshrc": 'print -r -- "user-zshrc-ran"\n',
+    }, [], ["user-zshenv-ran", "user-zshrc-ran"]),
+    "zsh-login": ("zsh", {
+        ".zshenv": 'print -r -- "user-zshenv-ran"\n',
+        ".zprofile": 'print -r -- "user-zprofile-ran zdotdir=${ZDOTDIR-unset}"\n',
+        ".zshrc": 'print -r -- "user-zshrc-ran"\n',
+        ".zlogin": 'print -r -- "user-zlogin-ran"\n',
+    }, ["-l"], ["user-zshenv-ran", "user-zprofile-ran zdotdir=unset", "user-zshrc-ran",
+                "user-zlogin-ran"]),
+    # XDG-style: .zshenv moves ZDOTDIR, and zsh reads the rest from there.
+    "zsh-xdg": ("zsh", {
+        ".zshenv": 'export ZDOTDIR="$HOME/.config/zsh"\n',
+        ".config/zsh/.zshrc": 'print -r -- "user-zshrc-ran zdotdir=$ZDOTDIR"\n',
+    }, [], ["user-zshrc-ran zdotdir=" + "{HOME}/.config/zsh"]),
+    # The same, spelled as a default -- which only works if ZDOTDIR arrives unset.
+    "zsh-xdg-default": ("zsh", {
+        ".zshenv": 'export ZDOTDIR="${ZDOTDIR:-$HOME/.config/zsh}"\n',
+        ".config/zsh/.zshrc": 'print -r -- "user-zshrc-ran zdotdir=$ZDOTDIR"\n',
+    }, [], ["user-zshrc-ran zdotdir=" + "{HOME}/.config/zsh"]),
+    # A theme that rebuilds PS1 on every prompt (powerlevel10k, starship), and a user precmd
+    # hook that reports $? and then returns something else -- 7, so a status that is right by
+# coincidence of being 0 cannot pass.
+    "zsh-rebuild-ps1": ("zsh", {
+        ".zshrc": """autoload -Uz add-zsh-hook
+__user_status() { print -r -- "hook-saw:$?"; return 7; }
+__user_prompt() { PS1="rebuilt %# "; }
+add-zsh-hook precmd __user_status
+add-zsh-hook precmd __user_prompt
+""",
+    }, [], ["hook-saw:0", "hook-saw:1"]),
+    # bash 5.1+ array PROMPT_COMMAND, with a user hook that returns 0 whatever happened.
+    "bash-array-pc": ("bash", {
+        ".bashrc": """__user_hook() { echo "hook-saw:$?"; return 7; }
+PROMPT_COMMAND=(__user_hook)
+""",
+    }, [], ["hook-saw:0", "hook-saw:1"]),
+    # The string form of the same, ending in the ';' that a careless join turns into ';;'.
+    "bash-string-pc": ("bash", {
+        ".bashrc": """__user_hook() { echo "hook-saw:$?"; return 7; }
+PROMPT_COMMAND='__user_hook;'
+""",
+    }, [], ["hook-saw:0", "hook-saw:1"]),
+    # A theme that rebuilds PS1 on every prompt, the way starship's bash hook does.
+    "bash-rebuild-ps1": ("bash", {
+        ".bashrc": """__user_prompt() { PS1='rebuilt\\$ '; }
+PROMPT_COMMAND='__user_prompt'
+""",
+    }, [], []),
+    "bash-rebuild-ps1-array": ("bash", {
+        ".bashrc": """__user_prompt() { PS1='rebuilt\\$ '; }
+PROMPT_COMMAND=(__user_prompt)
+""",
+    }, [], []),
+}
+
+args = sys.argv[1:]
+SCENARIO = None
+if "--list" in args:
+    for name, (shell, _, _, _) in SCENARIOS.items():
+        print(f"{name:24} {shell}")
+    sys.exit(0)
+if "--scenario" in args:
+    i = args.index("--scenario")
+    SCENARIO = args[i + 1]
+    del args[i:i + 2]
+    if SCENARIO not in SCENARIOS:
+        sys.exit(f"unknown scenario {SCENARIO}; --list shows them")
+
+SHELL = args[0] if args else (SCENARIOS[SCENARIO][0] if SCENARIO else "zsh")
 
 # An explicit binary, for testing a shell the system does not ship as its default —
 # macOS bash is 3.2 from 2007, so a modern one has to be named.
-BINARY = sys.argv[2] if len(sys.argv) > 2 else SHELL
+BINARY = args[1] if len(args) > 1 else SHELL
+
+if SCENARIO and SCENARIOS[SCENARIO][0] != SHELL:
+    sys.exit(f"scenario {SCENARIO} is for {SCENARIOS[SCENARIO][0]}, not {SHELL}")
 
 here = os.path.dirname(os.path.abspath(__file__))
 resources = os.path.join(
@@ -50,14 +136,31 @@ env["TERMINAL_SHELL_RESOURCES"] = resources
 env["PS1"] = "$ "
 env["TERMINAL_SHELL_INTEGRATION"] = "1"
 
+home = None
+required = []
+extra_args = []
+if SCENARIO:
+    _, files, extra_args, required = SCENARIOS[SCENARIO]
+    home = tempfile.mkdtemp(prefix="shell-integration-home-")
+    for rel, content in files.items():
+        path = os.path.join(home, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+    env["HOME"] = home
+    env.pop("ZDOTDIR", None)
+    required = [r.replace("{HOME}", home) for r in required]
+
 if SHELL == "bash":
-    env["TERMINAL_SHELL_BASH_INJECT"] = ""
+    env["TERMINAL_SHELL_BASH_INJECT"] = "login" if "-l" in extra_args else ""
     env["ENV"] = os.path.join(resources, "bash", "integration.bash")
-    argv = [BINARY, "--posix", "-i"]
+    argv = [BINARY, "--posix", "-i"] + extra_args
 elif SHELL == "zsh":
-    env["TERMINAL_SHELL_ZDOTDIR"] = env.get("HOME", "")
+    # As Prepare does: the user's own ZDOTDIR is handed over only when there is one.
+    if env.get("ZDOTDIR"):
+        env["TERMINAL_SHELL_ZDOTDIR"] = env["ZDOTDIR"]
     env["ZDOTDIR"] = os.path.join(resources, "zsh")
-    argv = [BINARY, "-i"]
+    argv = [BINARY, "-i"] + extra_args
 elif SHELL == "fish":
     # The parent of fish/, because fish searches each data directory for fish/vendor_conf.d.
     existing = env.get("XDG_DATA_DIRS", "")
@@ -129,25 +232,37 @@ def pump(fd, seconds, sink):
 
 chunks = []
 
+PROMPT_START = re.compile(rb"\x1b\]133;A")
 PROMPT_END = re.compile(rb"\x1b\]133;B")
 
 
+def count(pattern, sink):
+    # Joined, not per chunk: a mark split across two reads is still one mark.
+    return len(pattern.findall(b"".join(sink)))
+
+
 def pump_until_prompt(fd, seconds, sink, prompts_seen):
-    """Pump until one more prompt-end mark (OSC 133;B) has arrived, or the ceiling passes."""
+    """Pump until one more prompt has started (OSC 133;A) and, briefly, for its B."""
     end = time.time() + seconds
     while time.time() < end:
         if not pump(fd, 0.05, sink):
             return prompts_seen
-        seen = sum(len(PROMPT_END.findall(c)) for c in sink)
+        seen = count(PROMPT_START, sink)
         if seen > prompts_seen:
+            # Paced on A rather than B, because a missing B is one of the things this checks for
+            # and waiting on it would turn that finding into a ten-second stall.
+            settle = time.time() + 1.0
+            while time.time() < settle and count(PROMPT_END, sink) < seen:
+                if not pump(fd, 0.05, sink):
+                    break
             return seen
     return prompts_seen
 
 
 # Type only once the shell is at a prompt. A fixed startup wait typed the first command into a
 # cold pwsh before PSReadLine was reading -- the first prompt drew and nothing ran after it,
-# which is exactly what a broken script looks like. Pacing on the B mark instead is both robust
-# on a slow machine and quick on a fast one; the ceiling is for a shell that never gets there.
+# which is exactly what a broken script looks like. Pacing on the prompt marks instead is both
+# robust on a slow machine and quick on a fast one; the ceiling is for a shell that never gets there.
 seen = pump_until_prompt(fd, 30.0, chunks, 0)
 pump(fd, 0.3, chunks)   # let the line editor finish initialising behind the prompt
 
@@ -155,15 +270,20 @@ pump(fd, 0.3, chunks)   # let the line editor finish initialising behind the pro
 # CR, not LF: Enter is 0x0D on the wire. The line discipline maps it for bash, zsh and fish, but
 # PSReadLine puts the tty in raw mode and reads keys itself, and LF is Ctrl+J to it -- three
 # commands sent with LF became one line that never ran.
+# A shell that never reached a first prompt will not reach the next ones either.
+ceiling = 10.0 if seen else 1.0
 os.write(fd, b"echo hello\r")
-seen = pump_until_prompt(fd, 10.0, chunks, seen)
+seen = pump_until_prompt(fd, ceiling, chunks, seen)
 os.write(fd, b"false\r")
-seen = pump_until_prompt(fd, 10.0, chunks, seen)
+seen = pump_until_prompt(fd, ceiling, chunks, seen)
 os.write(fd, b"exit\r")
 pump(fd, 1.5, chunks)
 
 out = b"".join(chunks)
 text = out.decode("utf-8", "replace")
+
+if home:
+    shutil.rmtree(home, ignore_errors=True)
 
 if os.environ.get("RAW"):
     # The stream itself, escapes made visible -- what to read when the marks are wrong.
@@ -172,7 +292,7 @@ if os.environ.get("RAW"):
 marks = re.findall(r"\x1b\]133;([A-D])(?:;(\d+))?\x07", text)
 cwd = re.findall(r"\x1b\](?:7|9;9);([^\x07]*)\x07", text)
 
-print(f"shell    : {SHELL}  ({BINARY})")
+print(f"shell    : {SHELL}  ({BINARY})" + (f"  scenario {SCENARIO}" if SCENARIO else ""))
 print("133 marks:", " ".join(m[0] + (f"({m[1]})" if m[1] else "") for m in marks) or "NONE")
 print("osc 7    :", cwd[0] if cwd else "NONE")
 print()
@@ -186,9 +306,38 @@ if missing:
     sys.exit(1)
 
 statuses = [m[1] for m in marks if m[0] == "D"]
+starts = sum(1 for m in marks if m[0] == "A")
+ends = sum(1 for m in marks if m[0] == "B")
 print(f"all four marks present; exit statuses reported: {', '.join(statuses)}")
 print("expected 0 then 1, since the second command was `false`")
-# The verdict CI runs on: every mark, the two statuses in order, and a directory report.
-if statuses != ["0", "1"] or not cwd:
-    print("FAIL: statuses or working directory not as expected")
+print(f"prompts  : {starts} started (A), {ends} ended (B)")
+
+failures = []
+# The verdict CI runs on: every mark, the two statuses in order, a B for every prompt -- a theme
+# that rebuilds the prompt drops one appended at startup -- and a directory report.
+if statuses != ["0", "1"]:
+    failures.append("statuses not 0 then 1")
+# Three prompts: the first, and one after each command. Fewer means a prompt went unmarked.
+if starts < 3:
+    failures.append(f"only {starts} of 3 prompts marked with A")
+if ends != starts:
+    failures.append("a prompt without its B")
+if not cwd:
+    failures.append("no working directory report")
+
+hooks = re.findall(r"hook-saw:(\d+)", text)
+if hooks:
+    print("user hook saw:", " ".join(hooks))
+    # The last two prompts follow `echo hello` and `false`.
+    if hooks[-2:] != ["0", "1"]:
+        failures.append("the user's own hook saw the wrong $?")
+for needle in required:
+    found = needle in text
+    print(f"{'found  ' if found else 'MISSING'}  {needle}")
+    if not found:
+        failures.append(f"missing {needle!r}")
+
+if failures:
+    print("FAIL: " + "; ".join(failures))
     sys.exit(1)
+print("PASS")
