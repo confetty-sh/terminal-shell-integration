@@ -346,11 +346,15 @@ os.write(fd, b"echo hello\r")
 seen = pump_until_prompt(fd, ceiling, chunks, seen)
 os.write(fd, b"false\r")
 seen = pump_until_prompt(fd, ceiling, chunks, seen)
+# Everything up to here is what the verdict is on. What follows `exit` is the shell leaving -- fish
+# reports a D for the exit command itself -- and is shown, not judged.
+judged = len(b"".join(chunks))
 os.write(fd, b"exit\r")
 pump(fd, 1.5, chunks)
 
 out = b"".join(chunks)
 text = out.decode("utf-8", "replace")
+judged_text = out[:judged].decode("utf-8", "replace")
 
 if home:
     shutil.rmtree(home, ignore_errors=True)
@@ -359,8 +363,21 @@ if os.environ.get("RAW"):
     # The stream itself, escapes made visible -- what to read when the marks are wrong.
     print(text.replace("\x1b", "<ESC>").replace("\x07", "<BEL>").replace("\r", "<CR>"))
     print("-" * 60)
-marks = re.findall(r"\x1b\]133;([A-D])(?:;(\d+))?\x07", text)
-cwd = re.findall(r"\x1b\](?:7|9;9);([^\x07]*)\x07", text)
+# As a terminal reads them: ended by BEL or by ST (ESC \\), and with whatever parameters the shell
+# adds -- fish sends A;click_events=1 and C;cmdline_url=... of its own. Matching only BEL and bare
+# marks once hid a fish that sent every D twice, because that fish ends its marks with ST.
+MARK = r"\x1b\]133;([A-D])((?:;[^\x07\x1b]*)?)(?:\x07|\x1b\\)"
+
+
+def parse(stream):
+    # The status is D's first parameter; other marks' parameters are not this harness's business.
+    return [(kind, params.split(";")[1] if kind == "D" and params else "")
+            for kind, params in re.findall(MARK, stream)]
+
+
+marks = parse(text)
+judged_marks = parse(judged_text)
+cwd = re.findall(r"\x1b\](?:7|9;9);([^\x07\x1b]*)(?:\x07|\x1b\\)", text)
 
 print(f"shell    : {SHELL}  ({BINARY})" + (f"  scenario {SCENARIO}" if SCENARIO else ""))
 print("133 marks:", " ".join(m[0] + (f"({m[1]})" if m[1] else "") for m in marks) or "NONE")
@@ -375,12 +392,13 @@ if missing:
     print("A = prompt start, B = prompt end, C = command start, D = command finished")
     sys.exit(1)
 
-statuses = [m[1] for m in marks if m[0] == "D"]
-starts = sum(1 for m in marks if m[0] == "A")
-ends = sum(1 for m in marks if m[0] == "B")
+statuses = [m[1] for m in judged_marks if m[0] == "D"]
+starts = sum(1 for m in judged_marks if m[0] == "A")
+ends = sum(1 for m in judged_marks if m[0] == "B")
+commands = sum(1 for m in judged_marks if m[0] == "C")
 print(f"all four marks present; exit statuses reported: {', '.join(statuses)}")
 print("expected " + ("0 for the probe, then " if SHELL == "zsh" else "") + "0 then 1, since the last command was `false`")
-print(f"prompts  : {starts} started (A), {ends} ended (B)")
+print(f"prompts  : {starts} started (A), {ends} ended (B); {commands} commands started (C)")
 
 failures = []
 # The verdict CI runs on: every mark, the two statuses in order, a B for every prompt -- a theme
@@ -389,12 +407,16 @@ failures = []
 expected_statuses = (["0"] if probe else []) + ["0", "1"]
 if statuses != expected_statuses:
     failures.append(f"statuses not {', '.join(expected_statuses)}")
-# The first prompt, and one after each command. Fewer means a prompt went unmarked.
+# Exactly one of each: the first prompt and one after each command get an A and a B, each command
+# a C. Fewer means something went unmarked; more means two parties are marking -- a shell with
+# marks of its own, and the integration on top.
 expected_prompts = len(expected_statuses) + 1
-if starts < expected_prompts:
-    failures.append(f"only {starts} of {expected_prompts} prompts marked with A")
-if ends != starts:
-    failures.append("a prompt without its B")
+if starts != expected_prompts:
+    failures.append(f"{starts} prompts marked with A, expected {expected_prompts}")
+if ends != expected_prompts:
+    failures.append(f"{ends} prompts marked with B, expected {expected_prompts}")
+if commands != len(expected_statuses):
+    failures.append(f"{commands} commands marked with C, expected {len(expected_statuses)}")
 if not cwd:
     failures.append("no working directory report")
 

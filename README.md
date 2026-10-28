@@ -52,7 +52,7 @@ a new tab that opens where the old one was, and knowing whether the shell is bus
 |---|---|
 | **bash** | `--posix` plus `ENV` |
 | **zsh** | `ZDOTDIR`, put back in `.zshenv` before any of the user's files run |
-| **fish** | `XDG_DATA_DIRS` plus `vendor_conf.d`, which fish loads on its own |
+| **fish** | `XDG_DATA_DIRS` plus `vendor_conf.d`, which fish loads on its own; fish 4.0+ marks the prompt itself, and the script then adds only what fish does not |
 | **PowerShell** | `-NoExit -Command ". integration.ps1"` — runs *after* the profiles, so it wraps the prompt they installed |
 
 The PowerShell one is the one Ghostty never had to write, and it is the easiest of the four to
@@ -151,6 +151,19 @@ Three more came from configurations rather than shells, and are scenarios now:
   integration now hands the command's status on. The array form gives every element the command's
   status (bash 5.3), so its order never mattered there.
 
+And two in fish and the harness itself:
+
+- **fish marks its own prompt.** Since 4.0 fish sends `A`, `C` and `D` itself, and since 4.3 `B`
+  too, so the terminal got every mark twice. The harness never saw it: it only read marks ended by
+  BEL and without parameters, and fish 4.8 ends its marks with ST (`ESC \`) and adds
+  `click_events=1` and `cmdline_url=`. fish 4.2.1 ends them with BEL, and that is what CI's
+  Ubuntu 26.04 runner caught. The harness now reads marks as a terminal does and requires exactly
+  one of each per prompt and command; the script asks fish (`status test-feature mark-prompt`)
+  and leaves to it whatever it sends, keeping `OSC 7` and, before 4.3, `B`.
+- **`TERM`.** The harness passed its own environment through, and CI runners set no `TERM`; zsh
+  without one never runs `zle-line-init`, which on the first prompt is where `B` comes from under a
+  theme that rebuilds the prompt. A terminal always sets `TERM`, so the harness now does too.
+
 Verified against pwsh 7.6.5 on macOS. **Windows is not yet verified**: the script emits
 `OSC 9;9` with a bare path there rather than `file://`, because `file://host/C:/x` decodes to
 `/C:/x`, and Windows PowerShell 5.1 is targeted by syntax but has not been run.
@@ -160,7 +173,7 @@ drawing anything — fish asks for the kitty keyboard flags, the terminal versio
 colour, terminfo capabilities and the device attributes — and then wait. Silence leaves them blocked
 before the first prompt, which again looks exactly like integration that never loaded.
 
-Verified against zsh 5.9, bash 5.3.15 and fish 4.8.1. macOS ships bash 3.2 from 2007, which does not
+Verified against zsh 5.9, bash 5.3.15, and fish 4.8.1, 4.2.1 and 3.7.1. macOS ships bash 3.2 from 2007, which does not
 source `$ENV` in POSIX mode at all; Ghostty documents the same limitation for the same bash.
 
 ## License
