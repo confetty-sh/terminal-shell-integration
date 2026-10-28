@@ -39,42 +39,89 @@ import tempfile
 import time
 
 # Each scenario: the shell it is for, the files to write under a throwaway HOME, any extra
-# arguments, and text the run's output must contain. A user hook that prints "hook-saw:$?" is
-# checked for seeing the status of the user's COMMAND, which is what integration must not disturb.
+# arguments, and text the run's output must contain. An optional fifth element holds "env",
+# variables to set for the shell, and "absent", text the output must NOT contain; both may name
+# {HOME}. A user hook that prints "hook-saw:$?" is checked for seeing the status of the user's
+# COMMAND, which is what integration must not disturb.
+#
+# Every zsh run also types a probe at the live prompt, so the zsh scenarios check the session's
+# final environment -- "probe zdotdir=..." names what ZDOTDIR ended up as.
+_ZSH_THEME = """autoload -Uz add-zsh-hook
+__user_status() { print -r -- "hook-saw:$?"; return 7; }
+__user_prompt() { PS1="rebuilt %# "; }
+add-zsh-hook precmd __user_status
+add-zsh-hook precmd __user_prompt
+"""
 SCENARIOS = {
-    # The four files, each reporting that it ran, in their default place.
+    # Default place, non-login: .zprofile and .zlogin are there and must not run.
     "zsh-plain": ("zsh", {
         ".zshenv": 'print -r -- "user-zshenv-ran"\n',
+        ".zprofile": 'print -r -- "user-zprofile-ran"\n',
         ".zshrc": 'print -r -- "user-zshrc-ran"\n',
-    }, [], ["user-zshenv-ran", "user-zshrc-ran"]),
+        ".zlogin": 'print -r -- "user-zlogin-ran"\n',
+    }, [], ["user-zshenv-ran", "user-zshrc-ran", "probe zdotdir=unset"],
+       {"absent": ["user-zprofile-ran", "user-zlogin-ran"]}),
+    # The four files, each reporting that it ran, in their default place.
     "zsh-login": ("zsh", {
         ".zshenv": 'print -r -- "user-zshenv-ran"\n',
         ".zprofile": 'print -r -- "user-zprofile-ran zdotdir=${ZDOTDIR-unset}"\n',
         ".zshrc": 'print -r -- "user-zshrc-ran"\n',
         ".zlogin": 'print -r -- "user-zlogin-ran"\n',
     }, ["-l"], ["user-zshenv-ran", "user-zprofile-ran zdotdir=unset", "user-zshrc-ran",
-                "user-zlogin-ran"]),
+                "user-zlogin-ran", "probe zdotdir=unset"]),
+    # No .zshenv at all, which is not an error.
+    "zsh-no-zshenv": ("zsh", {
+        ".zshrc": 'print -r -- "user-zshrc-ran"\n',
+    }, [], ["user-zshrc-ran", "probe zdotdir=unset"]),
+    # ZDOTDIR already set in the environment the terminal was started from, so the host hands it
+    # over; the files in HOME are decoys that must not run.
+    "zsh-env-zdotdir": ("zsh", {
+        "zdot/.zshenv": 'print -r -- "user-zshenv-ran zdotdir=$ZDOTDIR"\n',
+        "zdot/.zshrc": 'print -r -- "user-zshrc-ran"\n',
+        ".zshenv": 'print -r -- "home-zshenv-ran"\n',
+        ".zshrc": 'print -r -- "home-zshrc-ran"\n',
+    }, [], ["user-zshenv-ran zdotdir={HOME}/zdot", "user-zshrc-ran", "probe zdotdir={HOME}/zdot"],
+       {"env": {"ZDOTDIR": "{HOME}/zdot"}, "absent": ["home-zshenv-ran", "home-zshrc-ran"]}),
+    "zsh-env-zdotdir-login": ("zsh", {
+        "zdot/.zshenv": 'print -r -- "user-zshenv-ran"\n',
+        "zdot/.zprofile": 'print -r -- "user-zprofile-ran zdotdir=$ZDOTDIR"\n',
+        "zdot/.zshrc": 'print -r -- "user-zshrc-ran"\n',
+        "zdot/.zlogin": 'print -r -- "user-zlogin-ran"\n',
+    }, ["-l"], ["user-zshenv-ran", "user-zprofile-ran zdotdir={HOME}/zdot", "user-zshrc-ran",
+                "user-zlogin-ran", "probe zdotdir={HOME}/zdot"],
+       {"env": {"ZDOTDIR": "{HOME}/zdot"}}),
     # XDG-style: .zshenv moves ZDOTDIR, and zsh reads the rest from there.
     "zsh-xdg": ("zsh", {
         ".zshenv": 'export ZDOTDIR="$HOME/.config/zsh"\n',
         ".config/zsh/.zshrc": 'print -r -- "user-zshrc-ran zdotdir=$ZDOTDIR"\n',
-    }, [], ["user-zshrc-ran zdotdir=" + "{HOME}/.config/zsh"]),
+        ".zshrc": 'print -r -- "home-zshrc-ran"\n',
+    }, [], ["user-zshrc-ran zdotdir=" + "{HOME}/.config/zsh", "probe zdotdir={HOME}/.config/zsh"],
+       {"absent": ["home-zshrc-ran"]}),
+    "zsh-xdg-login": ("zsh", {
+        ".zshenv": 'export ZDOTDIR="$HOME/.config/zsh"\n',
+        ".config/zsh/.zprofile": 'print -r -- "user-zprofile-ran zdotdir=$ZDOTDIR"\n',
+        ".config/zsh/.zshrc": 'print -r -- "user-zshrc-ran"\n',
+        ".config/zsh/.zlogin": 'print -r -- "user-zlogin-ran"\n',
+        ".zprofile": 'print -r -- "home-zprofile-ran"\n',
+    }, ["-l"], ["user-zprofile-ran zdotdir={HOME}/.config/zsh", "user-zshrc-ran",
+                "user-zlogin-ran", "probe zdotdir={HOME}/.config/zsh"],
+       {"absent": ["home-zprofile-ran"]}),
     # The same, spelled as a default -- which only works if ZDOTDIR arrives unset.
     "zsh-xdg-default": ("zsh", {
         ".zshenv": 'export ZDOTDIR="${ZDOTDIR:-$HOME/.config/zsh}"\n',
         ".config/zsh/.zshrc": 'print -r -- "user-zshrc-ran zdotdir=$ZDOTDIR"\n',
-    }, [], ["user-zshrc-ran zdotdir=" + "{HOME}/.config/zsh"]),
+    }, [], ["user-zshrc-ran zdotdir=" + "{HOME}/.config/zsh", "probe zdotdir={HOME}/.config/zsh"]),
     # A theme that rebuilds PS1 on every prompt (powerlevel10k, starship), and a user precmd
     # hook that reports $? and then returns something else -- 7, so a status that is right by
-# coincidence of being 0 cannot pass.
+    # coincidence of being 0 cannot pass.
     "zsh-rebuild-ps1": ("zsh", {
-        ".zshrc": """autoload -Uz add-zsh-hook
-__user_status() { print -r -- "hook-saw:$?"; return 7; }
-__user_prompt() { PS1="rebuilt %# "; }
-add-zsh-hook precmd __user_status
-add-zsh-hook precmd __user_prompt
-""",
-    }, [], ["hook-saw:0", "hook-saw:1"]),
+        ".zshrc": 'print -r -- "user-zshrc-ran"\n' + _ZSH_THEME,
+    }, [], ["user-zshrc-ran", "hook-saw:0", "hook-saw:1", "probe zdotdir=unset"]),
+    # The same theme under the XDG layout, in a login shell.
+    "zsh-rebuild-ps1-xdg-login": ("zsh", {
+        ".zshenv": 'export ZDOTDIR="${ZDOTDIR:-$HOME/.config/zsh}"\n',
+        ".config/zsh/.zshrc": 'print -r -- "user-zshrc-ran"\n' + _ZSH_THEME,
+    }, ["-l"], ["user-zshrc-ran", "hook-saw:0", "hook-saw:1", "probe zdotdir={HOME}/.config/zsh"]),
     # bash 5.1+ array PROMPT_COMMAND, with a user hook that returns 0 whatever happened.
     "bash-array-pc": ("bash", {
         ".bashrc": """__user_hook() { echo "hook-saw:$?"; return 7; }
@@ -103,8 +150,8 @@ PROMPT_COMMAND=(__user_prompt)
 args = sys.argv[1:]
 SCENARIO = None
 if "--list" in args:
-    for name, (shell, _, _, _) in SCENARIOS.items():
-        print(f"{name:24} {shell}")
+    for name, spec in SCENARIOS.items():
+        print(f"{name:26} {spec[0]}")
     sys.exit(0)
 if "--scenario" in args:
     i = args.index("--scenario")
@@ -144,9 +191,11 @@ env["TERM"] = "xterm-256color"
 
 home = None
 required = []
+absent = []
 extra_args = []
 if SCENARIO:
-    _, files, extra_args, required = SCENARIOS[SCENARIO]
+    _, files, extra_args, required = SCENARIOS[SCENARIO][:4]
+    extras = SCENARIOS[SCENARIO][4] if len(SCENARIOS[SCENARIO]) > 4 else {}
     home = tempfile.mkdtemp(prefix="shell-integration-home-")
     for rel, content in files.items():
         path = os.path.join(home, rel)
@@ -155,7 +204,10 @@ if SCENARIO:
             f.write(content)
     env["HOME"] = home
     env.pop("ZDOTDIR", None)
+    for name, value in extras.get("env", {}).items():
+        env[name] = value.replace("{HOME}", home)
     required = [r.replace("{HOME}", home) for r in required]
+    absent = [a.replace("{HOME}", home) for a in extras.get("absent", [])]
 
 if SHELL == "bash":
     env["TERMINAL_SHELL_BASH_INJECT"] = "login" if "-l" in extra_args else ""
@@ -278,6 +330,18 @@ pump(fd, 0.3, chunks)   # let the line editor finish initialising behind the pro
 # commands sent with LF became one line that never ran.
 # A shell that never reached a first prompt will not reach the next ones either.
 ceiling = 10.0 if seen else 1.0
+
+# zsh: what the user's session ends up with. The handed-over ZDOTDIR must be gone from the shell
+# and from what its children inherit. Written so the command as typed -- which the terminal
+# echoes -- never contains the text checked for, only its output does. First, so the two
+# commands below are still the last two the user hooks see.
+probe = SHELL == "zsh"
+if probe:
+    os.write(fd, b"print -r -- \"probe zdotdir=${ZDOTDIR-unset} helper=${TERMINAL_SHELL_ZDOTDIR-gone}"
+                 b" child=$(env | grep -c '^TERMINAL_SHELL_ZDOTDIR=')\"\r")
+    seen = pump_until_prompt(fd, ceiling, chunks, seen)
+    required.append("helper=gone child=0")
+
 os.write(fd, b"echo hello\r")
 seen = pump_until_prompt(fd, ceiling, chunks, seen)
 os.write(fd, b"false\r")
@@ -315,17 +379,20 @@ statuses = [m[1] for m in marks if m[0] == "D"]
 starts = sum(1 for m in marks if m[0] == "A")
 ends = sum(1 for m in marks if m[0] == "B")
 print(f"all four marks present; exit statuses reported: {', '.join(statuses)}")
-print("expected 0 then 1, since the second command was `false`")
+print("expected " + ("0 for the probe, then " if SHELL == "zsh" else "") + "0 then 1, since the last command was `false`")
 print(f"prompts  : {starts} started (A), {ends} ended (B)")
 
 failures = []
 # The verdict CI runs on: every mark, the two statuses in order, a B for every prompt -- a theme
 # that rebuilds the prompt drops one appended at startup -- and a directory report.
-if statuses != ["0", "1"]:
-    failures.append("statuses not 0 then 1")
-# Three prompts: the first, and one after each command. Fewer means a prompt went unmarked.
-if starts < 3:
-    failures.append(f"only {starts} of 3 prompts marked with A")
+# The probe, when there is one, runs first and succeeds.
+expected_statuses = (["0"] if probe else []) + ["0", "1"]
+if statuses != expected_statuses:
+    failures.append(f"statuses not {', '.join(expected_statuses)}")
+# The first prompt, and one after each command. Fewer means a prompt went unmarked.
+expected_prompts = len(expected_statuses) + 1
+if starts < expected_prompts:
+    failures.append(f"only {starts} of {expected_prompts} prompts marked with A")
 if ends != starts:
     failures.append("a prompt without its B")
 if not cwd:
@@ -342,6 +409,11 @@ for needle in required:
     print(f"{'found  ' if found else 'MISSING'}  {needle}")
     if not found:
         failures.append(f"missing {needle!r}")
+for needle in absent:
+    found = needle in text
+    print(f"{'PRESENT' if found else 'absent '}  {needle}")
+    if found:
+        failures.append(f"unexpected {needle!r}")
 
 if failures:
     print("FAIL: " + "; ".join(failures))
