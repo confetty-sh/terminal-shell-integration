@@ -136,6 +136,12 @@ env["TERMINAL_SHELL_RESOURCES"] = resources
 env["PS1"] = "$ "
 env["TERMINAL_SHELL_INTEGRATION"] = "1"
 
+# A terminal always says what it is, and this one answers queries as an xterm would. Inheriting TERM
+# instead made the run depend on where it ran: CI runners set none, and zsh with no usable TERM
+# never runs zle-line-init -- a difference no user of a real terminal ever sees, reported as a
+# failure that would not reproduce at a desk.
+env["TERM"] = "xterm-256color"
+
 home = None
 required = []
 extra_args = []
