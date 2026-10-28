@@ -3,7 +3,8 @@
 # Sourced by the .zshenv beside it, which has already put the user's ZDOTDIR back -- and so before
 # the user's .zshrc runs, which matters below: hooks it adds land behind these.
 #
-# The approach follows Ghostty's; see .zshenv for why the code does not.
+# The approach follows Ghostty's, but not its code: Ghostty's shell scripts derive from Kitty's and
+# are GPLv3.
 
 __terminal_report_cwd() {
   # Only the percent needs escaping. The consumer unescapes what arrives, so a directory whose

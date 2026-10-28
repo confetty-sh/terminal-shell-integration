@@ -136,8 +136,10 @@ Three more came from configurations rather than shells, and are scenarios now:
 - **zsh with `ZDOTDIR` in `.zshenv`** (`zsh-xdg`). The XDG layout moves `ZDOTDIR` in `.zshenv`, and
   the integration lived in an injected `.zshrc` that was only reached while `ZDOTDIR` still pointed
   at it — so zsh went to the user's directory instead and integration silently never loaded. The
-  user's `ZDOTDIR` is now put back before their `.zshenv` runs, as Ghostty does, and the integration
-  is sourced from there. Handing over `HOME` when they had no `ZDOTDIR` broke the
+  injected `.zshenv` now puts the user's `ZDOTDIR` back before their `.zshenv` runs, as Ghostty
+  does, and then loads `integration.zsh` from the resources directory under zsh's own emulation,
+  so nothing depends on a `.zshrc` in the injected directory ever being read. Handing over `HOME`
+  when they had no `ZDOTDIR` broke the
   `${ZDOTDIR:-~/.config/zsh}` spelling of the same thing (`zsh-xdg-default`), so nothing is handed
   over then.
 - **A theme that rebuilds `PS1`** (`zsh-rebuild-ps1`, `bash-rebuild-ps1`). `B` was appended to the

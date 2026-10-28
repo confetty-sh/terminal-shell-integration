@@ -310,7 +310,8 @@ public static class ShellIntegration
     /// <para>zsh reads <c>.zshenv</c> first, from <c>ZDOTDIR</c>. The injected one puts the user's
     /// <c>ZDOTDIR</c> back before sourcing theirs, so their <c>.zshenv</c> can move it again — the
     /// XDG layout, <c>export ZDOTDIR=~/.config/zsh</c> — and zsh reads the remaining three from
-    /// wherever it ends up, exactly as it would have.</para>
+    /// wherever it ends up, exactly as it would have. By then <c>ZDOTDIR</c> is the user's, so the
+    /// script finds <c>integration.zsh</c> through <see cref="ResourcesVariable"/> instead.</para>
     /// <para>When the user had no <c>ZDOTDIR</c>, none is handed over, and the script leaves it
     /// unset rather than set to <c>HOME</c>. zsh reads from <c>HOME</c> either way, but a
     /// <c>.zshenv</c> that only supplies a default — <c>${ZDOTDIR:-~/.config/zsh}</c> — sees the
