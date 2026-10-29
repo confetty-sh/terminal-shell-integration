@@ -51,8 +51,8 @@ a new tab that opens where the old one was, and knowing whether the shell is bus
 | shell | mechanism |
 |---|---|
 | **bash** | `--posix` plus `ENV` |
-| **zsh** | `ZDOTDIR`, with all four startup files forwarded |
-| **fish** | `XDG_DATA_DIRS` plus `vendor_conf.d`, which fish loads on its own |
+| **zsh** | `ZDOTDIR`, put back in `.zshenv` before any of the user's files run |
+| **fish** | `XDG_DATA_DIRS` plus `vendor_conf.d`, which fish loads on its own; fish 4.0+ marks the prompt itself, and the script then adds only what fish does not |
 | **PowerShell** | `-NoExit -Command ". integration.ps1"` — runs *after* the profiles, so it wraps the prompt they installed |
 
 The PowerShell one is the one Ghostty never had to write, and it is the easiest of the four to
@@ -95,7 +95,13 @@ python3 tools/check-shell-integration.py zsh   # a real shell, through a pty
 python3 tools/check-shell-integration.py bash /opt/homebrew/bin/bash
 python3 tools/check-shell-integration.py fish
 python3 tools/check-shell-integration.py pwsh
+python3 tools/check-shell-integration.py zsh --scenario zsh-xdg   # a user configuration that broke it once
+python3 tools/check-shell-integration.py --list                   # every scenario
 ```
+
+Without `--scenario` the shell reads your own configuration. A scenario gives it a throwaway `HOME`
+holding one particular setup instead, and checks that the user's files ran, that every prompt got
+its `B`, and that the user's own prompt hooks saw their command's `$?` rather than the integration's.
 
 Both halves are needed, and the second is not optional. Four bugs were found by running real shells
 while the unit tests stayed green throughout — the C# side had the right answer every time:
@@ -125,6 +131,39 @@ PowerShell added three more, two of them in the harness rather than the script:
   first prompt carried a D for a command nobody ran. The first prompt now only records where
   history stands.
 
+Three more came from configurations rather than shells, and are scenarios now:
+
+- **zsh with `ZDOTDIR` in `.zshenv`** (`zsh-xdg`). The XDG layout moves `ZDOTDIR` in `.zshenv`, and
+  the integration lived in an injected `.zshrc` that was only reached while `ZDOTDIR` still pointed
+  at it — so zsh went to the user's directory instead and integration silently never loaded. The
+  injected `.zshenv` now puts the user's `ZDOTDIR` back before their `.zshenv` runs, as Ghostty
+  does, and then loads `integration.zsh` from the resources directory under zsh's own emulation,
+  so nothing depends on a `.zshrc` in the injected directory ever being read. Handing over `HOME`
+  when they had no `ZDOTDIR` broke the
+  `${ZDOTDIR:-~/.config/zsh}` spelling of the same thing (`zsh-xdg-default`), so nothing is handed
+  over then.
+- **A theme that rebuilds `PS1`** (`zsh-rebuild-ps1`, `bash-rebuild-ps1`). `B` was appended to the
+  prompt once, at startup; powerlevel10k or starship replaces the prompt every time and `B` went
+  with it. It is now re-added by a hook that runs after the user's. zsh runs its first round of
+  hooks from a copy of the list, so on the very first prompt `B` comes from `zle-line-init` instead.
+- **`$?` in the string form of `PROMPT_COMMAND`** (`bash-string-pc`). Each part sees the status of
+  the one before it, and the integration's ran first, so the user's own hooks always saw `0`. The
+  integration now hands the command's status on. The array form gives every element the command's
+  status (bash 5.3), so its order never mattered there.
+
+And two in fish and the harness itself:
+
+- **fish marks its own prompt.** Since 4.0 fish sends `A`, `C` and `D` itself, and since 4.3 `B`
+  too, so the terminal got every mark twice. The harness never saw it: it only read marks ended by
+  BEL and without parameters, and fish 4.8 ends its marks with ST (`ESC \`) and adds
+  `click_events=1` and `cmdline_url=`. fish 4.2.1 ends them with BEL, and that is what CI's
+  Ubuntu 26.04 runner caught. The harness now reads marks as a terminal does and requires exactly
+  one of each per prompt and command; the script asks fish (`status test-feature mark-prompt`)
+  and leaves to it whatever it sends, keeping `OSC 7` and, before 4.3, `B`.
+- **`TERM`.** The harness passed its own environment through, and CI runners set no `TERM`; zsh
+  without one never runs `zle-line-init`, which on the first prompt is where `B` comes from under a
+  theme that rebuilds the prompt. A terminal always sets `TERM`, so the harness now does too.
+
 Verified against pwsh 7.6.5 on macOS. **Windows is not yet verified**: the script emits
 `OSC 9;9` with a bare path there rather than `file://`, because `file://host/C:/x` decodes to
 `/C:/x`, and Windows PowerShell 5.1 is targeted by syntax but has not been run.
@@ -134,7 +173,7 @@ drawing anything — fish asks for the kitty keyboard flags, the terminal versio
 colour, terminfo capabilities and the device attributes — and then wait. Silence leaves them blocked
 before the first prompt, which again looks exactly like integration that never loaded.
 
-Verified against zsh 5.9, bash 5.3.15 and fish 4.8.1. macOS ships bash 3.2 from 2007, which does not
+Verified against zsh 5.9, bash 5.3.15, and fish 4.8.1, 4.2.1 and 3.7.1. macOS ships bash 3.2 from 2007, which does not
 source `$ENV` in POSIX mode at all; Ghostty documents the same limitation for the same bash.
 
 ## License

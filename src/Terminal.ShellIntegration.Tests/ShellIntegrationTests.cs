@@ -182,8 +182,8 @@ public class ShellIntegrationTests
     }
 
     /// <summary>
-    /// The injected rc restores this before sourcing anything of the user's, so a nested zsh reads
-    /// their configuration rather than the integration again.
+    /// The injected .zshenv restores this before sourcing anything of the user's, so their own
+    /// files, and a nested zsh, read their configuration rather than the integration again.
     /// </summary>
     [Test]
     public void Zsh_keeps_the_users_own_ZDOTDIR()
@@ -197,16 +197,39 @@ public class ShellIntegrationTests
     }
 
     /// <summary>
-    /// With no ZDOTDIR set, zsh reads from HOME — so that is what has to be restored, not nothing.
+    /// With no ZDOTDIR set, nothing is handed over and the script leaves it unset. Filling in HOME
+    /// instead looks equivalent and is not: a .zshenv that supplies a default,
+    /// ${ZDOTDIR:-~/.config/zsh}, then finds it already set and never moves to its own .zshrc.
     /// </summary>
-    [Test]
-    public void Zsh_falls_back_to_HOME_when_no_ZDOTDIR_is_set()
+    [TestCase(null)]
+    [TestCase("")]
+    public void Zsh_hands_over_no_ZDOTDIR_when_none_is_set(string? userZdotdir)
     {
         var env = new Dictionary<string, string> { ["HOME"] = "/home/someone" };
+        if (userZdotdir is not null)
+            env["ZDOTDIR"] = userZdotdir;
 
         var result = Prepare("/bin/zsh", null, env);
 
-        Assert.That(result.Environment[ShellIntegration.ZshDotDirVariable], Is.EqualTo("/home/someone"));
+        Assert.That(result.Environment.ContainsKey(ShellIntegration.ZshDotDirVariable), Is.False);
+        Assert.That(result.Environment["ZDOTDIR"], Is.EqualTo(Path.Combine(_resources, "zsh")));
+    }
+
+    /// <summary>
+    /// A stale hand-over in the environment would be restored as if it were the user's own.
+    /// </summary>
+    [Test]
+    public void Zsh_drops_a_stale_handed_over_ZDOTDIR()
+    {
+        var env = new Dictionary<string, string>
+        {
+            ["HOME"] = "/home/someone",
+            [ShellIntegration.ZshDotDirVariable] = "/somewhere/else",
+        };
+
+        var result = Prepare("/bin/zsh", null, env);
+
+        Assert.That(result.Environment.ContainsKey(ShellIntegration.ZshDotDirVariable), Is.False);
     }
 
     // ---- fish -----------------------------------------------------------------------------------

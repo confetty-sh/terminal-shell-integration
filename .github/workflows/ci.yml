@@ -54,7 +54,7 @@ jobs:
         run: |
           count=$(unzip -l ./artifacts/*.nupkg | grep -c "contentFiles/any/any/shell-integration/")
           echo "scripts in package: $count"
-          [ "$count" -eq 7 ] || { echo "::error::expected 7 scripts in the package, found $count"; exit 1; }
+          [ "$count" -eq 5 ] || { echo "::error::expected 5 scripts in the package, found $count"; exit 1; }
 
       - name: Install fish (ubuntu)
         if: runner.os == 'Linux'
@@ -64,6 +64,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           python3 tools/check-shell-integration.py bash
+          for s in $(python3 tools/check-shell-integration.py --list | awk '$2 == "bash" {print $1}'); do
+            python3 tools/check-shell-integration.py bash --scenario "$s"
+          done
           python3 tools/check-shell-integration.py fish
           python3 tools/check-shell-integration.py pwsh
 
@@ -72,4 +75,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           python3 tools/check-shell-integration.py zsh
+          for s in $(python3 tools/check-shell-integration.py --list | awk '$2 == "zsh" {print $1}'); do
+            python3 tools/check-shell-integration.py zsh --scenario "$s"
+          done
           python3 tools/check-shell-integration.py pwsh

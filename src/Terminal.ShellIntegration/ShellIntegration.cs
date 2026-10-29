@@ -81,7 +81,7 @@ public static class ShellIntegration
     /// <summary>The user's own ENV, which POSIX mode displaces.</summary>
     public const string BashEnvVariable = "TERMINAL_SHELL_BASH_ENV";
 
-    /// <summary>The user's own ZDOTDIR, which the injected one displaces.</summary>
+    /// <summary>The user's own ZDOTDIR, which the injected one displaces. Absent when they had none.</summary>
     public const string ZshDotDirVariable = "TERMINAL_SHELL_ZDOTDIR";
 
     /// <summary>
@@ -307,17 +307,24 @@ public static class ShellIntegration
     /// zsh, via <c>ZDOTDIR</c>.
     /// </summary>
     /// <remarks>
-    /// zsh reads <c>.zshenv</c>, <c>.zprofile</c>, <c>.zshrc</c> and <c>.zlogin</c> from
-    /// <c>ZDOTDIR</c>, so all four have to exist in the injected directory and forward to the
-    /// user's — providing only <c>.zshrc</c> silently drops the rest of their configuration.
+    /// <para>zsh reads <c>.zshenv</c> first, from <c>ZDOTDIR</c>. The injected one puts the user's
+    /// <c>ZDOTDIR</c> back before sourcing theirs, so their <c>.zshenv</c> can move it again — the
+    /// XDG layout, <c>export ZDOTDIR=~/.config/zsh</c> — and zsh reads the remaining three from
+    /// wherever it ends up, exactly as it would have. By then <c>ZDOTDIR</c> is the user's, so the
+    /// script finds <c>integration.zsh</c> through <see cref="ResourcesVariable"/> instead.</para>
+    /// <para>When the user had no <c>ZDOTDIR</c>, none is handed over, and the script leaves it
+    /// unset rather than set to <c>HOME</c>. zsh reads from <c>HOME</c> either way, but a
+    /// <c>.zshenv</c> that only supplies a default — <c>${ZDOTDIR:-~/.config/zsh}</c> — sees the
+    /// difference, and with <c>HOME</c> filled in it never moves and its <c>.zshrc</c> is never
+    /// read.</para>
     /// </remarks>
     private static ShellIntegrationResult PrepareZsh(
         List<string> args, Dictionary<string, string> env, string resources, ShellKind kind)
     {
-        // The script restores this first, so anything the user's own files spawn sees the real one.
-        env[ZshDotDirVariable] = env.TryGetValue("ZDOTDIR", out var userZdotdir) && !string.IsNullOrEmpty(userZdotdir)
-            ? userZdotdir
-            : env.GetValueOrDefault("HOME", string.Empty);
+        if (env.TryGetValue("ZDOTDIR", out var userZdotdir) && !string.IsNullOrEmpty(userZdotdir))
+            env[ZshDotDirVariable] = userZdotdir;
+        else
+            env.Remove(ZshDotDirVariable);
 
         env["ZDOTDIR"] = resources;
 
