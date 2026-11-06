@@ -1,4 +1,5 @@
-# Shell integration for bash: OSC 133 prompt marks and OSC 7 working directory.
+# Shell integration for bash: OSC 133 prompt marks and OSC 7 working directory, plus the features
+# the host turned on in TERMINAL_SHELL_FEATURES (see the end of this file).
 #
 # Sourced through $ENV with bash started in POSIX mode, because --init-file is silently ignored for
 # a login shell and POSIX mode sources $ENV whatever kind of shell it is. The price is here: this
@@ -85,6 +86,38 @@ unset __terminal_flags __terminal_login __terminal_noprofile __terminal_norc __t
 
 __terminal_osc() { builtin printf '\033]%s\007' "$1"; }
 
+# Whether the host turned a feature on. The list is Ghostty's shape -- cursor:blink,sudo,title --
+# so a name is matched whole, up to its comma or the colon that carries a setting.
+__terminal_feature() { [[ ",${TERMINAL_SHELL_FEATURES:-}," == *",$1"[,:]* ]]; }
+
+# The cursor for the prompt (DECSCUSR 5 a blinking bar, 6 a steady one), or empty when the feature
+# is off. Each command gets 0, the terminal's own default and so the user's, back.
+__terminal_prompt_cursor=
+if __terminal_feature cursor; then
+  if [[ ",${TERMINAL_SHELL_FEATURES}," == *",cursor:steady,"* ]]; then
+    __terminal_prompt_cursor=$'\033[6 q'
+  else
+    __terminal_prompt_cursor=$'\033[5 q'
+  fi
+fi
+
+__terminal_title=0
+__terminal_feature title && __terminal_title=1
+
+# The working directory as a title, with the home directory spelled ~ -- and only the home
+# directory itself or what is under it, so /home/jo is not taken for ~ when HOME is /home/j.
+__terminal_report_title() {
+  local dir="$PWD"
+  if [[ -n "${HOME:-}" && "$HOME" != / ]]; then
+    if [[ "$dir" == "$HOME" ]]; then
+      dir='~'
+    elif [[ "$dir" == "$HOME"/* ]]; then
+      dir="~${dir#"$HOME"}"
+    fi
+  fi
+  builtin printf '\033]2;%s\007' "${dir//[[:cntrl:]]/}"
+}
+
 # Working directory, so a new tab can open where this one is.
 __terminal_report_cwd() {
   # Only the percent needs escaping. The consumer unescapes what arrives, so a directory whose
@@ -109,6 +142,13 @@ __terminal_precmd() {
 
   __terminal_report_cwd
   __terminal_osc "133;A"
+
+  [[ -n "$__terminal_prompt_cursor" ]] && builtin printf '%s' "$__terminal_prompt_cursor"
+  [[ "$__terminal_title" == 1 ]] && __terminal_report_title
+
+  # Where history stands as the prompt is drawn, so the preexec can tell whether the command it is
+  # about to see went into history -- see the title, there.
+  __terminal_histcmd="${HISTCMD:-}"
 
   # In the string form of PROMPT_COMMAND each hook sees the status of the one before it, and this
   # one runs first. Handing the command's status on is what lets the user's own hooks -- a prompt
@@ -138,6 +178,24 @@ __terminal_prompt_end() {
 # is not, which is why the flag that used to live here now lives in the precmd below.
 __terminal_preexec() {
   builtin printf '\033]133;C\007' > /dev/tty
+  [[ -n "$__terminal_prompt_cursor" ]] && builtin printf '\033[0 q' > /dev/tty
+  [[ "$__terminal_title" == 1 ]] && __terminal_command_title
+}
+
+# The command line as the title, while it runs. bash hands PS0 nothing of the command, so it is read
+# back from history -- but only when it went there. A command HISTCONTROL left out, or one typed
+# with history off, leaves the newest entry the command BEFORE it, which as a title would be
+# confidently wrong. History numbers say which: HISTCMD has moved on since the prompt only when this
+# command was saved. Unsaved, the directory title stays.
+__terminal_command_title() {
+  [[ -n "${__terminal_histcmd:-}" && -n "${HISTCMD:-}" ]] || return 0
+  (( HISTCMD > __terminal_histcmd )) || return 0
+
+  local last
+  last="$(HISTTIMEFORMAT= builtin history 1)"
+  # "  42  the command", with a * after the number when the entry was edited.
+  [[ "$last" =~ ^[[:space:]]*[0-9]+\*?[[:space:]]+(.*)$ ]] || return 0
+  builtin printf '\033]2;%s\007' "${BASH_REMATCH[1]//[[:cntrl:]]/}" > /dev/tty
 }
 
 # Added around whatever the user already had, so it all keeps running: the precmd first, so it sees
@@ -160,3 +218,66 @@ fi
 if [[ "${PS0:-}" != *__terminal_preexec* ]]; then
   PS0='$(__terminal_preexec)'"${PS0:-}"
 fi
+
+# ---- features that wrap a command ------------------------------------------------------------
+#
+# Only over a plain command: an alias or function of the user's is theirs, and wrapping it would
+# either lose what it does or loop. By now the user's startup files have run, so theirs are known.
+
+__terminal_plain_command() { [[ "$(builtin type -t "$1" 2>/dev/null)" == file ]]; }
+
+# sudo: keep TERMINFO, which sudo's env_reset drops. Only when there is one -- a host that ships its
+# own terminfo sets it, and a TERM from the system database needs nothing kept. sudoedit (-e,
+# --edit) is left alone, since it never runs a program on this terminal.
+if __terminal_feature sudo && [[ -n "${TERMINFO:-}" ]] && __terminal_plain_command sudo; then
+  sudo() {
+    local arg letters letter skip=0
+    for arg in "$@"; do
+      if (( skip )); then skip=0; continue; fi
+      case "$arg" in
+        -e|--edit) builtin command sudo "$@"; return ;;
+        --close-from|--chdir|--group|--prompt|--chroot|--role|--command-timeout|--type|--other-user|--user)
+          skip=1 ;;  # its value is the next argument
+        --) break ;;
+        --*) ;;
+        -?*)
+          # Short options, alone or run together: -E, -iu root, -uroot. A letter that takes a value
+          # takes the rest of the run, or the next argument when it is the last.
+          letters="${arg#-}"
+          while [[ -n "$letters" ]]; do
+            letter="${letters:0:1}"
+            letters="${letters:1}"
+            case "$letter" in
+              e) builtin command sudo "$@"; return ;;
+              [CDgpRrTtUu]) [[ -z "$letters" ]] && skip=1; break ;;
+            esac
+          done ;;
+        *=*) ;;
+        *) break ;;  # the command sudo is to run; what follows is its own
+      esac
+    done
+    builtin command sudo --preserve-env=TERMINFO "$@"
+  }
+fi
+
+# ssh-env: offer the remote what this terminal is. SendEnv adds to whatever the user's ssh_config
+# sends, and the remote takes only what its sshd_config AcceptEnv allows. When TERM comes from a
+# private terminfo (TERMINFO is set), the remote will not have it, so the connection gets
+# xterm-256color instead.
+if __terminal_feature ssh-env && __terminal_plain_command ssh; then
+  ssh() {
+    if [[ -n "${TERMINFO:-}" ]]; then
+      TERM=xterm-256color builtin command ssh -o SendEnv=COLORTERM -o SendEnv=TERM_PROGRAM \
+        -o SendEnv=TERM_PROGRAM_VERSION "$@"
+    else
+      builtin command ssh -o SendEnv=COLORTERM -o SendEnv=TERM_PROGRAM \
+        -o SendEnv=TERM_PROGRAM_VERSION "$@"
+    fi
+  }
+fi
+
+# ssh-terminfo and path are accepted and do nothing. Ghostty installs its own terminfo on the remote
+# and puts its own CLI on PATH; a host whose TERM every remote already has (xterm-256color) has no
+# terminfo to install, and this library has no CLI.
+
+unset -f __terminal_plain_command

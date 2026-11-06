@@ -85,6 +85,12 @@ public static class ShellIntegration
     public const string ZshDotDirVariable = "TERMINAL_SHELL_ZDOTDIR";
 
     /// <summary>
+    /// The features the scripts turn on, as <see cref="ShellFeatures.ToEnvironmentValue"/> writes
+    /// them. Absent when none are on.
+    /// </summary>
+    public const string FeaturesVariable = "TERMINAL_SHELL_FEATURES";
+
+    /// <summary>
     /// Works out what to spawn so the shell reports its prompts and working directory.
     /// </summary>
     /// <param name="shellPath">The shell being launched, as a path or a bare name.</param>
@@ -99,7 +105,7 @@ public static class ShellIntegration
         IReadOnlyList<string>? args,
         IReadOnlyDictionary<string, string>? environment,
         string resourcesDirectory)
-        => Prepare(shellPath, args, environment, resourcesDirectory, ShellKind.Unknown);
+        => Prepare(shellPath, args, environment, resourcesDirectory, ShellKind.Unknown, ShellFeatures.Default);
 
     /// <summary>
     /// The same, with the shell named by the host rather than worked out from its path.
@@ -116,6 +122,22 @@ public static class ShellIntegration
         IReadOnlyDictionary<string, string>? environment,
         string resourcesDirectory,
         ShellKind kind)
+        => Prepare(shellPath, args, environment, resourcesDirectory, kind, ShellFeatures.Default);
+
+    /// <summary>
+    /// The same, with the features the scripts should turn on.
+    /// </summary>
+    /// <remarks>
+    /// The overloads without it give Ghostty's defaults, <see cref="ShellFeatures.Default"/>: a
+    /// host that offers no setting gets what a Ghostty user gets with none in their config.
+    /// </remarks>
+    public static ShellIntegrationResult Prepare(
+        string shellPath,
+        IReadOnlyList<string>? args,
+        IReadOnlyDictionary<string, string>? environment,
+        string resourcesDirectory,
+        ShellKind kind,
+        ShellFeatures features)
     {
         var originalArgs = args is null ? new List<string>() : new List<string>(args);
         var env = environment is null
@@ -144,6 +166,13 @@ public static class ShellIntegration
 
         env[MarkerVariable] = "1";
         env[ResourcesVariable] = resourcesDirectory;
+
+        // Removed rather than left empty when nothing is on, so a value inherited from wherever the
+        // host itself was started cannot turn on what this host turned off.
+        if (features.ToEnvironmentValue() is { } featureList)
+            env[FeaturesVariable] = featureList;
+        else
+            env.Remove(FeaturesVariable);
 
         return kind switch
         {
