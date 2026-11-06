@@ -152,7 +152,10 @@ function __terminal_wrap_commands --on-event fish_prompt --description 'wrap sud
         function ssh --wraps ssh --description 'ssh, offering the terminal environment'
             set -l send -o SendEnv=COLORTERM -o SendEnv=TERM_PROGRAM -o SendEnv=TERM_PROGRAM_VERSION
             if test -n "$TERMINFO"
-                TERM=xterm-256color command ssh $send $argv
+                # Through env, not `TERM=... command ssh`: that sets fish's own TERM and puts it
+                # back, and fish answers a change of TERM by drawing the prompt again -- an extra
+                # prompt, marks and all, after every ssh.
+                command env TERM=xterm-256color ssh $send $argv
             else
                 command ssh $send $argv
             end
