@@ -209,7 +209,9 @@ Then the PowerShell scenarios, each of which failed before its fix:
 On Windows the script emits `OSC 9;9` with a bare path rather than `file://`, because
 `file://host/C:/x` decodes to `/C:/x`.
 
-Verified against pwsh 7.6.5 on macOS. **Windows is not yet verified.**
+Verified against pwsh 7.6.5 on macOS, and on Windows in CI (windows-latest, Windows Server 2025
+build 26100) against pwsh 7.6.9 with PSReadLine 2.4.5 and Windows PowerShell 5.1.26100 with
+PSReadLine 2.0.0, through pywinpty's ConPTY. Every PowerShell scenario passes under both.
 
 The harness answers terminal queries as it goes. Modern shells interrogate the terminal before
 drawing anything — fish asks for the kitty keyboard flags, the terminal version, the background
