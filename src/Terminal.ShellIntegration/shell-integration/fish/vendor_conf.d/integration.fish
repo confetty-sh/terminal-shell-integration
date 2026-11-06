@@ -1,4 +1,5 @@
-# Shell integration for fish: OSC 133 prompt marks and OSC 7 working directory.
+# Shell integration for fish: OSC 133 prompt marks and OSC 7 working directory, plus the features
+# the host turned on in TERMINAL_SHELL_FEATURES (at the end).
 #
 # Reached by adding this tree to XDG_DATA_DIRS. fish sources vendor_conf.d from every data directory
 # on its own, so nothing of the user's is displaced and nothing has to be replayed — which makes
@@ -83,4 +84,82 @@ if test $__terminal_fish_marks_end = 0; and not functions -q __terminal_original
         __terminal_original_fish_prompt
         printf '\033]133;B\007'
     end
+end
+
+# ---- features ---------------------------------------------------------------------------------
+#
+# The list is Ghostty's shape -- cursor:blink,sudo,title -- so it is split on commas and each entry
+# on the colon that carries a setting.
+set -g __terminal_features
+set -g __terminal_cursor_steady 0
+for entry in (string split , -- "$TERMINAL_SHELL_FEATURES")
+    set -l name (string split -m 1 : -- $entry)
+    set -a __terminal_features $name[1]
+    test "$entry" = cursor:steady; and set __terminal_cursor_steady 1
+end
+
+# title: fish keeps the window title itself, from fish_title -- the running command, and the
+# directory at the prompt, which is the feature already -- so nothing is added here, as Ghostty adds
+# nothing. A user who wants another title overrides fish_title, as fish documents.
+
+# cursor: a bar at the prompt (DECSCUSR 5 blinks, 6 is steady), and 0 -- the terminal's default,
+# so the user's own -- for each command. Not under fish's vi cursor, which sets the shape for each
+# mode itself and would be fought on every prompt.
+if contains cursor $__terminal_features
+    set -g __terminal_bar 5
+    test $__terminal_cursor_steady = 1; and set __terminal_bar 6
+
+    function __terminal_prompt_cursor --on-event fish_prompt --description 'a bar at the prompt'
+        functions -q fish_vi_cursor_handle; or printf '\033[%d q' $__terminal_bar
+    end
+
+    function __terminal_command_cursor --on-event fish_preexec --description 'the user cursor for commands'
+        functions -q fish_vi_cursor_handle; or printf '\033[0 q'
+    end
+end
+
+# sudo and ssh are wrapped at the first prompt, once config.fish and conf.d have run, so a sudo or
+# ssh function of the user's -- an alias is one too -- is known and left alone.
+function __terminal_wrap_commands --on-event fish_prompt --description 'wrap sudo and ssh once'
+    functions -e __terminal_wrap_commands
+
+    # sudo: keep TERMINFO, which sudo's env_reset drops. Only when there is one -- a host that
+    # ships its own terminfo sets it, and a TERM from the system database needs nothing kept.
+    # sudoedit (-e, --edit) is left alone, since it never runs a program on this terminal.
+    if contains sudo $__terminal_features; and test -n "$TERMINFO"
+        and test (type -t sudo 2>/dev/null; or echo none) = file
+        function sudo --wraps sudo --description 'sudo, keeping TERMINFO'
+            for arg in $argv
+                switch $arg
+                    case -e --edit
+                        command sudo $argv
+                        return
+                    case '-*' '*=*'
+                    case '*'
+                        break # the command sudo is to run; what follows is its own
+                end
+            end
+            command sudo --preserve-env=TERMINFO $argv
+        end
+    end
+
+    # ssh-env: offer the remote what this terminal is. SendEnv adds to whatever the user's
+    # ssh_config sends, and the remote takes only what its sshd_config AcceptEnv allows. When TERM
+    # comes from a private terminfo (TERMINFO is set) the remote will not have it, so the
+    # connection gets xterm-256color instead.
+    if contains ssh-env $__terminal_features
+        and test (type -t ssh 2>/dev/null; or echo none) = file
+        function ssh --wraps ssh --description 'ssh, offering the terminal environment'
+            set -l send -o SendEnv=COLORTERM -o SendEnv=TERM_PROGRAM -o SendEnv=TERM_PROGRAM_VERSION
+            if test -n "$TERMINFO"
+                TERM=xterm-256color command ssh $send $argv
+            else
+                command ssh $send $argv
+            end
+        end
+    end
+
+    # ssh-terminfo and path are accepted and do nothing. Ghostty installs its own terminfo on the
+    # remote and puts its own CLI on PATH; a host whose TERM every remote already has
+    # (xterm-256color) has no terminfo to install, and this library has no CLI.
 end

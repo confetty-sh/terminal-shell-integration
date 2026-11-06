@@ -1,4 +1,5 @@
-# Shell integration for PowerShell: OSC 133 prompt marks and OSC 7 working directory.
+# Shell integration for PowerShell: OSC 133 prompt marks and OSC 7 working directory, plus the
+# features the host turned on in TERMINAL_SHELL_FEATURES.
 #
 # Loaded by `pwsh -NoExit -Command ". <this file>"`. That runs AFTER the profiles, so
 # $function:prompt is whatever the user -- or oh-my-posh, or starship -- installed, and it is
@@ -21,7 +22,28 @@ $Global:__TerminalIntegration = @{
     ReadLineReturned = $true # false while PSReadLine is still reading the line its prompt drew
     ExitCodeBefore   = $null # $LASTEXITCODE, and the newest error, as they stood when the
     ErrorBefore      = $null # command began: what decides which of the two its failure was
+    Bar              = $null # DECSCUSR for the prompt's cursor, when the cursor feature is on
+    Title            = $false
+    SudoPath         = $null # the programs the wrappers below run
+    SshPath          = $null
 }
+
+# Whether the host turned a feature on. The list is Ghostty's shape -- cursor:blink,sudo,title --
+# so a name is matched whole, ahead of the colon that carries a setting. Case matters, as in
+# Ghostty's own names.
+function Global:__Terminal-HasFeature([string] $Name) {
+    foreach ($entry in "$env:TERMINAL_SHELL_FEATURES".Split(',')) {
+        if ($entry.Split(':')[0] -ceq $Name) { return $true }
+    }
+    return $false
+}
+
+if (__Terminal-HasFeature 'cursor') {
+    # 5 blinks, 6 is steady.
+    $Global:__TerminalIntegration.Bar = 5
+    if (",$env:TERMINAL_SHELL_FEATURES," -clike '*,cursor:steady,*') { $Global:__TerminalIntegration.Bar = 6 }
+}
+$Global:__TerminalIntegration.Title = __Terminal-HasFeature 'title'
 
 function Global:__Terminal-Osc([string] $Body) {
     return "$([char]27)]$Body$([char]7)"
@@ -71,7 +93,11 @@ function Global:__Terminal-InstallReadLineHook {
         if (-not [string]::IsNullOrWhiteSpace($line)) {
             $state.CommandRunning = $true
             __Terminal-RememberBefore
-            [Console]::Write((__Terminal-Osc '133;C'))
+            $out = __Terminal-Osc '133;C'
+            # 0 is the terminal's own default, so the user's cursor, for as long as the command runs.
+            if ($null -ne $state.Bar) { $out += "$([char]27)[0 q" }
+            if ($state.Title) { $out += __Terminal-Osc "2;$(__Terminal-Printable $line)" }
+            [Console]::Write($out)
         }
         return $line
     }
@@ -150,6 +176,11 @@ function Global:prompt {
     $out += __Terminal-ReportCwd
     $out += __Terminal-Osc '133;A'
 
+    # The bar only once the line reader is wrapped: that is what puts the user's cursor back for
+    # the command, and without it the bar would stay for everything that runs.
+    if (($null -ne $state.Bar) -and ($null -ne $state.OriginalReadLine)) { $out += "$([char]27)[$($state.Bar) q" }
+    if ($state.Title) { $out += __Terminal-Osc "2;$(__Terminal-TitleLocation)" }
+
     # Written now rather than returned with the prompt. A prompt drawn with Write-Host -- posh-git,
     # and a great many hand-written ones -- is on the screen before its function returns, so marks
     # that rode in the returned string came after the prompt they were meant to open.
@@ -181,3 +212,65 @@ function Global:__Terminal-UserPrompt([bool] $Succeeded) {
     }
     return "PS $($ExecutionContext.SessionState.Path.CurrentLocation)$('>' * ($NestedPromptLevel + 1)) "
 }
+
+# A title has no room for control characters: an ESC or BEL in one would end it early and the rest
+# would arrive as output. A command over several lines becomes one.
+function Global:__Terminal-Printable([string] $Text) {
+    return ($Text -replace '[\x00-\x1f\x7f]', '')
+}
+
+# Where the shell is, for the title, with the home directory spelled ~ -- and only the home directory
+# itself or what is under it, so /home/jo is not taken for ~ when home is /home/j. Any location,
+# not only a directory: in Env: the title says Env:\.
+function Global:__Terminal-TitleLocation {
+    $location = $ExecutionContext.SessionState.Path.CurrentLocation.Path
+    $homeDir = $HOME
+    if ($IsWindows -or $env:OS -eq 'Windows_NT') { $comparison = [StringComparison]::OrdinalIgnoreCase }
+    else { $comparison = [StringComparison]::Ordinal }
+    if (-not [string]::IsNullOrEmpty($homeDir) -and $homeDir.Length -gt 1) {
+        $homeDir = $homeDir.TrimEnd('\', '/')
+        if ($location.Equals($homeDir, $comparison)) {
+            $location = '~'
+        } elseif ($location.StartsWith($homeDir + [IO.Path]::DirectorySeparatorChar, $comparison)) {
+            $location = '~' + $location.Substring($homeDir.Length)
+        }
+    }
+    return (__Terminal-Printable $location)
+}
+
+# ---- features that wrap a command ------------------------------------------------------------
+#
+# Only over a plain program: an alias or function of the user's is theirs, and wrapping it would
+# either lose what it does or loop. The profiles have run by now, so theirs are known.
+function Global:__Terminal-PlainProgram([string] $Name) {
+    if ($null -ne (Get-Command -Name $Name -CommandType Alias, Function -ErrorAction SilentlyContinue)) { return $null }
+    $program = Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $program) { return $null }
+    return $program.Source
+}
+
+# sudo: keep TERMINFO, which sudo's env_reset drops. Only when there is one -- a host that ships its
+# own terminfo sets it, and a TERM from the system database needs nothing kept. Not on Windows,
+# which has no terminfo.
+#
+# Each wrapper is a script of its own beside this one, reached through an alias, not a function:
+# through a function a command that failed reads as success -- see sudo.ps1.
+if ((__Terminal-HasFeature 'sudo') -and -not [string]::IsNullOrEmpty($env:TERMINFO) `
+        -and -not ($IsWindows -or $env:OS -eq 'Windows_NT')) {
+    $Global:__TerminalIntegration.SudoPath = __Terminal-PlainProgram 'sudo'
+    if ($null -ne $Global:__TerminalIntegration.SudoPath) {
+        Set-Alias -Name sudo -Value (Join-Path $PSScriptRoot 'sudo.ps1') -Scope Global
+    }
+}
+
+# ssh-env: offer the remote what this terminal is -- see ssh.ps1.
+if (__Terminal-HasFeature 'ssh-env') {
+    $Global:__TerminalIntegration.SshPath = __Terminal-PlainProgram 'ssh'
+    if ($null -ne $Global:__TerminalIntegration.SshPath) {
+        Set-Alias -Name ssh -Value (Join-Path $PSScriptRoot 'ssh.ps1') -Scope Global
+    }
+}
+
+# ssh-terminfo and path are accepted and do nothing. Ghostty installs its own terminfo on the remote
+# and puts its own CLI on PATH; a host whose TERM every remote already has (xterm-256color) has no
+# terminfo to install, and this library has no CLI.

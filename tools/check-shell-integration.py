@@ -28,6 +28,11 @@ work, and the two real bugs found while writing them were both invisible to ever
 
 A shell that emits nothing looks exactly like a shell that was never instrumented, so this prints
 what arrived rather than passing or failing.
+
+The feature scenarios (cursor, title, sudo, ssh-env) never run the real sudo or ssh: they put
+shims of those names first on PATH, which print what they were given and exit. A scenario that
+needs a TERM from a private terminfo -- the case sudo and ssh-env exist for -- compiles one from
+xterm-256color into its throwaway HOME, named xterm-harness.
 """
 import os
 import re
@@ -215,6 +220,137 @@ Set-PSReadLineKeyHandler -Chord Ctrl+g -Function AcceptLine
     }, [], []),
 }
 
+# ---- the features, the same cases for every shell -------------------------------------------
+#
+# Extras the feature scenarios use, on top of those above: "features" is TERMINAL_SHELL_FEATURES
+# (absent when not given, so every scenario above runs with none); "shims" names the commands to
+# shadow on PATH; "required_count" is patterns to find a set number of times, or once for each of
+# the "prompts" or "commands" the run judged; "terminfo" compiles xterm-harness into {HOME}/terminfo and sets TERMINFO there;
+# "required_re" is patterns the output must match; "windows" replaces any of these on Windows.
+#
+# A shim prints "shim-<name> term=... colorterm=... argv=..." and exits with $SHIM_EXIT, 0 unless
+# the scenario sets it. The commands typed never contain
+# "shim-" or "argv=", so what is checked can only have come from the shim itself.
+
+# What each shell calls its own startup file, and how it defines a function that shadows a command
+# -- which a wrapper must leave alone.
+_RC = {"bash": ".bashrc", "zsh": ".zshrc", "fish": ".config/fish/config.fish", "pwsh": "profile.ps1"}
+
+
+def _user_function(shell, name):
+    # An alias where the shell has them, because that is what tells WHEN a wrapper was defined: a
+    # user function defined later replaces an early wrapper anyway, but an alias expands into it,
+    # and the wrapper runs under the user's own name. fish's aliases are functions.
+    if shell in ("bash", "zsh"):
+        return f"alias {name}='{name} --user-{name}'\n"
+    if shell == "fish":
+        return f"function {name}; echo user-{name}-ran; end\n"
+    if shell == "pwsh":
+        return f"function {name} {{ 'user-{name}-ran' }}\n"
+    return f"{name}() {{ echo user-{name}-ran; }}\n"
+
+
+def _user_ran(shell, name, rest):
+    """What shows that the user's own sudo or ssh ran, and not a wrapper."""
+    return f"argv=--user-{name} {rest}" if shell in ("bash", "zsh") else f"user-{name}-ran"
+
+
+_SEND = "-o SendEnv=COLORTERM -o SendEnv=TERM_PROGRAM -o SendEnv=TERM_PROGRAM_VERSION"
+_CURSORS = [r"\x1b\[[0-6] q"]
+
+
+def _term_after(shell):
+    return 'echo "term-after=$env:TERM"' if shell == "pwsh" else 'echo "term-after=$TERM"'
+
+
+def _feature_scenarios(shell):
+    sudo = "sudo -u root true"
+    out = {
+        # A bar at every prompt and the user's cursor back for every command. Counted, not just
+        # found, so a bar that only went out once would not pass.
+        f"{shell}-cursor": (shell, {}, [], [], {
+            "features": "cursor:blink", "required_count": {r"\x1b\[5 q": "prompts", r"\x1b\[0 q": "commands"},
+            "absent_re": [r"\x1b\[6 q"]}),
+        f"{shell}-cursor-steady": (shell, {}, [], [], {
+            "features": "cursor:steady", "required_count": {r"\x1b\[6 q": "prompts", r"\x1b\[0 q": "commands"},
+            "absent_re": [r"\x1b\[5 q"]}),
+        # Everything off. Nothing the features add may appear; fish keeps its own title.
+        f"{shell}-features-off": (shell, {}, [], [], {
+            "absent_re": _CURSORS + ([] if shell == "fish" else [r"\x1b\]2;"])}),
+        f"{shell}-title": (shell, {}, [], [], {
+            "features": "title", "commands": [("cd ~", "0"), ("echo title-probe", "0")],
+            "required_re": [r"\x1b\]2;~\x07", r"\x1b\]2;echo title-probe\x07"],
+            "absent_re": _CURSORS}),
+        # sudo keeps TERMINFO, except for sudoedit; an -e after the command is the command's own.
+        f"{shell}-sudo": (shell, {}, [], [
+            "argv=--preserve-env=TERMINFO -u root true", "argv=-e /etc/hosts",
+            "argv=--preserve-env=TERMINFO ls -e"], {
+            "features": "sudo", "terminfo": True, "shims": ["sudo"],
+            "commands": [(sudo, "0"), ("sudo -e /etc/hosts", "0"), ("sudo ls -e", "0")],
+            "windows": {"required": ["argv=-u root true", "argv=-e /etc/hosts", "argv=ls -e"],
+                        "absent": ["--preserve-env"]}}),
+        # Without a TERMINFO there is nothing to keep, and with the feature off nothing is wrapped.
+        f"{shell}-sudo-no-terminfo": (shell, {}, [], ["argv=-u root true"], {
+            "features": "sudo", "shims": ["sudo"], "commands": [(sudo, "0")],
+            "absent": ["--preserve-env"]}),
+        f"{shell}-sudo-off": (shell, {}, [], ["argv=-u root true"], {
+            "features": "cursor:blink,title", "terminfo": True, "shims": ["sudo"],
+            "commands": [(sudo, "0")], "absent": ["--preserve-env"]}),
+        # A sudo of the user's own is theirs. In zsh and fish it is defined after the integration
+        # loads, which is what deferring the wrappers to the first prompt is for. The shim's argv
+        # must not gain --preserve-env through the user's alias either.
+        f"{shell}-sudo-user": (shell, {_RC[shell]: _user_function(shell, "sudo")}, [],
+                               [_user_ran(shell, "sudo", "-u root true")], {
+            "features": "sudo", "terminfo": True, "shims": ["sudo"], "commands": [(sudo, "0")],
+            "absent": ["--preserve-env"]}),
+        f"{shell}-ssh-env": (shell, {}, [], [
+            f"shim-ssh term=xterm-256color colorterm=truecolor argv={_SEND} example.invalid"], {
+            "features": "ssh-env", "shims": ["ssh"], "env": {"COLORTERM": "truecolor"},
+            "commands": [("ssh example.invalid", "0")]}),
+        # A TERM from a private terminfo is xterm-256color for the connection, and only for it.
+        f"{shell}-ssh-env-terminfo": (shell, {}, [], [
+            f"shim-ssh term=xterm-256color colorterm=truecolor argv={_SEND} example.invalid",
+            "term-after=xterm-harness"], {
+            "features": "ssh-env", "terminfo": True, "shims": ["ssh"],
+            "env": {"COLORTERM": "truecolor", "TERM": "xterm-harness"},
+            "commands": [("ssh example.invalid", "0"), (_term_after(shell), "0")]}),
+        # What ssh exits with is what the command reports, wrapper or not.
+        f"{shell}-ssh-env-status": (shell, {}, [], [f"argv={_SEND} example.invalid"], {
+            "features": "ssh-env", "shims": ["ssh"], "env": {"SHIM_EXIT": "255"},
+            "commands": [("ssh example.invalid", "255"), ("ssh example.invalid", "255")]}),
+        # ssh-env is off by default, as in Ghostty: the defaults leave ssh alone.
+        f"{shell}-ssh-off": (shell, {}, [], ["argv=example.invalid"], {
+            "features": "cursor:blink,path,title", "shims": ["ssh"],
+            "commands": [("ssh example.invalid", "0")], "absent": ["SendEnv"]}),
+        f"{shell}-ssh-user": (shell, {_RC[shell]: _user_function(shell, "ssh")}, [],
+                              [_user_ran(shell, "ssh", "example.invalid")], {
+            "features": "ssh-env", "shims": ["ssh"], "commands": [("ssh example.invalid", "0")],
+            "absent": ["SendEnv"]}),
+    }
+    if shell == "bash":
+        # bash reads the title's command back from history, which HISTCONTROL can keep it out of.
+        # Then the newest entry is the command before, and it must not become the title.
+        out["bash-title-ignorespace"] = ("bash", {".bashrc": "HISTCONTROL=ignorespace\n"}, [], [], {
+            "features": "title", "commands": [("echo seen", "0"), (" echo unseen", "0")],
+            "required_count": {r"\x1b\]2;echo seen\x07": 1},
+            "absent_re": [r"\x1b\]2; ?echo unseen"]})
+    if shell == "zsh":
+        # vi command mode gets a block, insert mode the bar again. ESC leaves insert mode, and the
+        # pause keeps the Enter after it from arriving as one Alt+Enter keystroke.
+        out["zsh-cursor-vi"] = ("zsh", {".zshrc": "bindkey -v\nKEYTIMEOUT=1\n"}, [], [], {
+            "features": "cursor:blink", "commands": [("echo vi-ran\x1b{pause}", "0")],
+            "required": ["vi-ran"], "required_re": [r"\x1b\[1 q", r"\x1b\[5 q"]})
+    if shell == "fish":
+        # fish sets the title itself, so with the feature on or off it is fish's.
+        out["fish-title"] = ("fish", {}, [], [], {
+            "features": "title", "commands": [("cd ~", "0"), ("echo title-probe", "0")],
+            "required_re": [r"\x1b\][02];[^\x07]*title-probe"]})
+    return out
+
+
+for _shell in ("bash", "zsh", "fish", "pwsh"):
+    SCENARIOS.update(_feature_scenarios(_shell))
+
 args = sys.argv[1:]
 SCENARIO = None
 if "--list" in args:
@@ -270,9 +406,18 @@ between_ab = []
 extra_args = []
 extras = {}
 files = {}
+# Nothing turns a feature on that the scenario did not, nor gives it a terminfo it did not ask for.
+env.pop("TERMINAL_SHELL_FEATURES", None)
+env.pop("TERMINFO", None)
+required_re = []
+required_count = {}
 if SCENARIO:
     _, files, extra_args, required = SCENARIOS[SCENARIO][:4]
-    extras = SCENARIOS[SCENARIO][4] if len(SCENARIOS[SCENARIO]) > 4 else {}
+    extras = dict(SCENARIOS[SCENARIO][4]) if len(SCENARIOS[SCENARIO]) > 4 else {}
+    if WINDOWS and "windows" in extras:
+        overrides = extras.pop("windows")
+        required = overrides.pop("required", required)
+        extras.update(overrides)
     home = tempfile.mkdtemp(prefix="shell-integration-home-")
     for rel, content in files.items():
         path = os.path.join(home, rel)
@@ -286,6 +431,42 @@ if SCENARIO:
     env.pop("XDG_CONFIG_HOME", None)
     for name, value in extras.get("env", {}).items():
         env[name] = value.replace("{HOME}", home)
+    if "features" in extras:
+        env["TERMINAL_SHELL_FEATURES"] = extras["features"]
+    if extras.get("shims"):
+        shims = os.path.join(home, "shims")
+        os.makedirs(shims)
+        for name in extras["shims"]:
+            if WINDOWS:
+                with open(os.path.join(shims, name + ".cmd"), "w") as f:
+                    f.write(f"@echo shim-{name} term=%TERM% colorterm=%COLORTERM% argv=%*\n"
+                            "@exit /b %SHIM_EXIT%\n")
+            else:
+                path = os.path.join(shims, name)
+                with open(path, "w") as f:
+                    f.write("#!/bin/sh\n"
+                            f"printf 'shim-{name} term=%s colorterm=%s argv=%s\\n'"
+                            ' "${TERM-unset}" "${COLORTERM-unset}" "$*"\n'
+                            'exit "${SHIM_EXIT:-0}"\n')
+                os.chmod(path, 0o755)
+        env["PATH"] = shims + os.pathsep + env.get("PATH", "")
+        env.setdefault("SHIM_EXIT", "0")
+    if extras.get("terminfo"):
+        # A TERM only this directory knows, as a host shipping its own terminfo would give.
+        terminfo = os.path.join(home, "terminfo")
+        os.makedirs(terminfo)
+        if not WINDOWS:
+            import subprocess
+            source = subprocess.run(["infocmp", "-x", "xterm-256color"], check=True,
+                                    capture_output=True, text=True).stdout
+            source = re.sub(r"^xterm-256color\|", "xterm-harness|xterm-256color|", source, flags=re.M)
+            with open(os.path.join(home, "harness.terminfo"), "w") as f:
+                f.write(source)
+            subprocess.run(["tic", "-x", "-o", terminfo, os.path.join(home, "harness.terminfo")], check=True)
+        env["TERMINFO"] = terminfo
+    required_re = extras.get("required_re", [])
+    required_count = extras.get("required_count", {})
+    required = required + extras.get("required", [])
     required = [r.replace("{HOME}", home) for r in required]
     absent = [a.replace("{HOME}", home) for a in extras.get("absent", [])]
     absent_re = extras.get("absent_re", [])
@@ -509,11 +690,20 @@ try:
     for text, _ in COMMANDS:
         # A command over several lines is typed a line at a time, as a person would, so the line
         # editor sees each Enter on its own.
+        # {pause} splits a write, for a key that must arrive on its own -- ESC, which with the
+        # next byte straight behind it reads as one Alt chord.
+        def type_paced(chunk):
+            parts = chunk.split("{pause}")
+            for part in parts[:-1]:
+                shell.write(part.encode("utf-8"))
+                pump(0.3, chunks)
+            shell.write(parts[-1].encode("utf-8") + b"\r")
+
         lines = text.split("\r")
         for line in lines[:-1]:
-            shell.write(line.encode("utf-8") + b"\r")
+            type_paced(line)
             pump(0.3, chunks)
-        shell.write(lines[-1].encode("utf-8") + b"\r")
+        type_paced(lines[-1])
         seen = pump_until_prompt(ceiling, chunks, seen)
     # Everything up to here is what the verdict is on. What follows `exit` is the shell leaving -- fish
     # reports a D for the exit command itself -- and is shown, not judged.
@@ -613,6 +803,17 @@ for needle in absent:
     print(f"{'PRESENT' if found else 'absent '}  {needle}")
     if found:
         failures.append(f"unexpected {needle!r}")
+for pattern in required_re:
+    found = re.search(pattern, judged_text)
+    print(f"{'found  ' if found else 'MISSING'}  /{pattern}/")
+    if not found:
+        failures.append(f"missing /{pattern}/")
+for pattern, expected in required_count.items():
+    expected = {"prompts": expected_prompts, "commands": len(expected_statuses)}.get(expected, expected)
+    n = len(re.findall(pattern, judged_text))
+    print(f"{'found  ' if n == expected else 'COUNT  '}  /{pattern}/ x{n}, expected {expected}")
+    if n != expected:
+        failures.append(f"/{pattern}/ {n} times, expected {expected}")
 for pattern in absent_re:
     found = re.search(pattern, text)
     print(f"{'PRESENT' if found else 'absent '}  /{pattern}/" + (f"  {found.group(0)!r}" if found else ""))

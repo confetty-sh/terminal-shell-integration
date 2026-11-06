@@ -48,6 +48,53 @@ nothing outside the BCL. MIT.
 Which buys jump-to-previous-prompt, click-to-select a command's output, exit status in the margin,
 a new tab that opens where the old one was, and knowing whether the shell is busy without guessing.
 
+## Features
+
+On top of the marks, the scripts implement Ghostty's
+[`shell-integration-features`](https://ghostty.org/docs/config/reference#shell-integration-features),
+with its syntax and its defaults, so a Ghostty config means the same thing here:
+
+```csharp
+var features = ShellFeatures.Parse("no-cursor,sudo");          // Ghostty's syntax; FormatException if bad
+features = features with { CursorBlink = false };              // from the host's cursor-style-blink
+var result = ShellIntegration.Prepare(shell, args, env, resources, ShellKind.Unknown, features);
+```
+
+A comma-separated list where `no-` turns a feature off and anything not named keeps its default, or
+`true`/`false` for all of them. The overloads without features give the defaults. They reach the
+scripts as `TERMINAL_SHELL_FEATURES`, shaped as Ghostty's `GHOSTTY_SHELL_FEATURES` is
+(`cursor:blink,path,title`), and absent when nothing is on.
+
+| feature | default | what it does | bash | zsh | fish | PowerShell |
+|---|---|---|---|---|---|---|
+| `cursor` | on | a bar at the prompt (DECSCUSR 5, or 6 steady), the user's cursor back (0) for each command | ✓ | ✓, a block in vi command mode | ✓, unless fish's vi cursor is on | ✓, with PSReadLine |
+| `title` | on | `OSC 2`: the directory at the prompt, the command line while it runs | ✓ | ✓ | fish's own `fish_title` | ✓ |
+| `sudo` | off | `sudo --preserve-env=TERMINFO`, when `TERMINFO` is set; not for `sudo -e` | ✓ | ✓ | ✓ | ✓, not on Windows |
+| `ssh-env` | off | `ssh -o SendEnv=` for `COLORTERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`; `TERM=xterm-256color` for the connection when `TERMINFO` is set | ✓ | ✓ | ✓ | ✓ |
+| `ssh-terminfo` | off | accepted, does nothing | – | – | – | – |
+| `path` | on | accepted, does nothing | – | – | – | – |
+
+`sudo` and `ssh` are wrapped only when they are plain programs: an alias or function of the user's
+is theirs and is left alone. zsh and fish wrap them at the first prompt, once the user's own startup
+files have defined whatever they define. In PowerShell each wrapper is a script of its own,
+`pwsh/sudo.ps1` and `pwsh/ssh.ps1`, reached through an alias: called through a function, a native
+command that failed leaves the caller's `$?` true, and the prompt would report the failed ssh as a
+success. A script's `exit` sets `$?` and `$LASTEXITCODE` as the program itself would.
+
+**`TERMINFO` is the switch for the terminfo half of these.** Ghostty sets it to its own terminfo, for
+`TERM=xterm-ghostty`; a host whose `TERM` is in the system database, such as `xterm-256color`,
+sets none, and then `sudo` has nothing to keep and `ssh-env` has no `TERM` to replace. It still
+forwards the other three variables, which the remote's `sshd_config` must `AcceptEnv`.
+
+**`ssh-terminfo` and `path` do nothing, deliberately.** Ghostty's `ssh-terminfo` copies its terminfo
+to the remote with `infocmp | ssh host tic`, and a `TERM` every remote already has needs no copying;
+a host that ships its own terminfo can revisit it. `path` puts Ghostty's command-line tool on `PATH`,
+and this library has no tool. Both are parsed so a Ghostty config carrying them is not refused.
+
+`title` in bash reads the command back from history, because `PS0` is handed nothing. A command that
+never reached history (`HISTCONTROL=ignorespace`, history off) keeps the directory title rather
+than taking the previous command's.
+
 ## How each shell is reached
 
 | shell | mechanism |
@@ -75,7 +122,8 @@ had already solved problems worth not rediscovering.
 ## Design
 
 **No dependencies.** The library references nothing outside the BCL; the scripts use shell builtins
-only, and fork no processes. There is no UI, no PTY and no terminal emulator here — the transform is
+only. They fork nothing at the prompt; bash's `PS0` runs its hook in a subshell, and with `title` on
+reads the command back from history through one more. There is no UI, no PTY and no terminal emulator here — the transform is
 a pure function over strings, which is what makes the shell-specific quirks testable without
 spawning anything.
 
