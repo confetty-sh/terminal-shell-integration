@@ -20,7 +20,9 @@ else
     Console.WriteLine($"left alone: {result.Skipped}");
 ```
 
-That is the whole API. Arguments and environment in, arguments and environment out.
+That is the whole API. Arguments and environment in, arguments and environment out. One overload
+takes a `ShellKind` as well, for a shell whose path says nothing about what it is — a wrapper
+script — when the user has said which it is, as Ghostty's `shell-integration = zsh` does.
 
 ## Install
 
@@ -96,12 +98,23 @@ python3 tools/check-shell-integration.py bash /opt/homebrew/bin/bash
 python3 tools/check-shell-integration.py fish
 python3 tools/check-shell-integration.py pwsh
 python3 tools/check-shell-integration.py zsh --scenario zsh-xdg   # a user configuration that broke it once
+python3 tools/check-shell-integration.py pwsh powershell --scenario pwsh-statuses   # Windows PowerShell 5.1
 python3 tools/check-shell-integration.py --list                   # every scenario
 ```
 
 Without `--scenario` the shell reads your own configuration. A scenario gives it a throwaway `HOME`
 holding one particular setup instead, and checks that the user's files ran, that every prompt got
 its `B`, and that the user's own prompt hooks saw their command's `$?` rather than the integration's.
+A PowerShell scenario runs with `-NoProfile` and dot-sources its own `profile.ps1` ahead of the
+integration in the same `-Command` — the scope and order pwsh gives a real profile, and the only
+way to give it a throwaway one on Windows, where the profile lives under Documents and no variable
+moves it. Some scenarios type their own commands and say what status each must report.
+
+On Windows there is no pty, so the harness opens a ConPTY through
+[pywinpty](https://pypi.org/project/pywinpty/) (`pip install pywinpty`), and runs only the
+PowerShells. pywinpty carries its own `conpty.dll` and `OpenConsole.exe`, the console host Windows
+Terminal ships, rather than the one in the system. PSReadLine keeps its history under `%APPDATA%`
+there, which nothing moves, so the harness puts that file back as it found it.
 
 Both halves are needed, and the second is not optional. Four bugs were found by running real shells
 while the unit tests stayed green throughout — the C# side had the right answer every time:
@@ -164,9 +177,41 @@ And two in fish and the harness itself:
   without one never runs `zle-line-init`, which on the first prompt is where `B` comes from under a
   theme that rebuilds the prompt. A terminal always sets `TERM`, so the harness now does too.
 
-Verified against pwsh 7.6.5 on macOS. **Windows is not yet verified**: the script emits
-`OSC 9;9` with a bare path there rather than `file://`, because `file://host/C:/x` decodes to
-`/C:/x`, and Windows PowerShell 5.1 is targeted by syntax but has not been run.
+Then the PowerShell scenarios, each of which failed before its fix:
+
+- **A failing cmdlet after a failing native command** (`pwsh-statuses`). `$LASTEXITCODE` belongs
+  to the last NATIVE command and nothing else touches it, so after `git` exited 3 a failing
+  `Get-Item` reported 3 too. The native code is now used only when `$LASTEXITCODE` moved, or when
+  PowerShell recorded no error of its own — which it does for everything but a native command.
+- **The user's prompt saw `$?` as `True`** (`pwsh-return-prompt`, `pwsh-write-host-prompt`).
+  starship and oh-my-posh read it to colour the prompt after a failure; by the time the wrapper
+  called them it said only that the wrapper's own statements had succeeded. `$?` cannot be
+  assigned, but a failing statement sets it, and `Write-Error -ErrorAction Ignore` fails without
+  being recorded anywhere.
+- **A prompt drawn with `Write-Host`** (`pwsh-write-host-prompt`). posh-git and a great many
+  hand-written prompts write as they go, so their text was on the screen before the function
+  returned — and `D`, `OSC 7` and `A` rode in the returned string, after the prompt they open.
+  They are now written before the user's prompt runs.
+- **PSReadLine redraws the prompt** (`pwsh-multiline`). Input over several lines, `InvokePrompt`
+  and transient prompts all call the prompt function again while the line is still being read,
+  and every redraw was marked as a new prompt. A prompt called before the line reader returned is
+  now drawn without marks, as zsh's `reset-prompt` does not rerun `precmd`.
+- **A prompt that throws** (`pwsh-throwing-prompt`) took every mark down with it. It now falls back
+  to PowerShell's default prompt, as PowerShell itself does.
+- **A location that is not a directory** (`pwsh-provider`). In `Env:` or `HKLM:` the location has
+  no filesystem path, and `OSC 7` went out with an empty one. The last filesystem location is
+  reported instead, which is where a new tab should open.
+- **`pwsh script.ps1`.** A bare argument is a script — `-File` to pwsh, `-Command` to Windows
+  PowerShell — and the shell runs it and exits; `-NoExit -Command` added after it reached the script
+  as two arguments of its own. So did any abbreviation of a one-shot switch, which PowerShell
+  accepts down to the shortest unambiguous prefix (`-comm`, `-fi`, `-noni`). Both are left alone now.
+
+On Windows the script emits `OSC 9;9` with a bare path rather than `file://`, because
+`file://host/C:/x` decodes to `/C:/x`.
+
+Verified against pwsh 7.6.5 on macOS, and on Windows in CI (windows-latest, Windows Server 2025
+build 26100) against pwsh 7.6.9 with PSReadLine 2.4.5 and Windows PowerShell 5.1.26100 with
+PSReadLine 2.0.0, through pywinpty's ConPTY. Every PowerShell scenario passes under both.
 
 The harness answers terminal queries as it goes. Modern shells interrogate the terminal before
 drawing anything — fish asks for the kitty keyboard flags, the terminal version, the background

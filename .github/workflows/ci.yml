@@ -2,8 +2,8 @@
 # them. The unit tests cover the transform; the README is explicit that they are not enough --
 # every bug worth having found here was found by a real shell through a pty -- so the pty
 # harness is a required step, not a nicety. Hosted runners carry pwsh everywhere, bash 5 on
-# ubuntu, and zsh on macOS; fish is installed on ubuntu for the run. Windows has no pty for the
-# harness to open, so it builds, tests and packs only.
+# ubuntu, and zsh on macOS; fish is installed on ubuntu for the run. Windows has no pty, so there
+# the harness opens a ConPTY through pywinpty, and runs pwsh and Windows PowerShell 5.1.
 name: CI
 
 on:
@@ -69,6 +69,9 @@ jobs:
           done
           python3 tools/check-shell-integration.py fish
           python3 tools/check-shell-integration.py pwsh
+          for s in $(python3 tools/check-shell-integration.py --list | awk '$2 == "pwsh" {print $1}'); do
+            python3 tools/check-shell-integration.py pwsh --scenario "$s"
+          done
 
       # macOS ships bash 3.2, which does not source $ENV in POSIX mode; the README says so.
       - name: Real shells through a pty (macOS)
@@ -79,3 +82,24 @@ jobs:
             python3 tools/check-shell-integration.py zsh --scenario "$s"
           done
           python3 tools/check-shell-integration.py pwsh
+          for s in $(python3 tools/check-shell-integration.py --list | awk '$2 == "pwsh" {print $1}'); do
+            python3 tools/check-shell-integration.py pwsh --scenario "$s"
+          done
+
+      # The same script under both PowerShells Windows has: pwsh 7, and the 5.1 that ships with it.
+      - name: Real shells through a ConPTY (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m pip install --quiet pywinpty
+          # The versions the README's verification line names.
+          foreach ($binary in 'pwsh', 'powershell') {
+            & $binary -NoProfile -Command '"$($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion), PSReadLine $((Get-Module -ListAvailable PSReadLine | Sort-Object Version -Descending | Select-Object -First 1).Version), on $([Environment]::OSVersion.VersionString)"'
+          }
+          $scenarios = python tools/check-shell-integration.py --list | ForEach-Object { $f = -split $_; if ($f[1] -eq 'pwsh') { $f[0] } }
+          foreach ($binary in 'pwsh', 'powershell') {
+            foreach ($s in $scenarios) {
+              python tools/check-shell-integration.py pwsh $binary --scenario $s
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+            }
+          }

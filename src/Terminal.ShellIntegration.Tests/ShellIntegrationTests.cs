@@ -294,6 +294,43 @@ public class ShellIntegrationTests
         Assert.That(env.ContainsKey("ZDOTDIR"), Is.False);
     }
 
+    // ---- the shell named by the host ------------------------------------------------------------
+
+    /// <summary>
+    /// A wrapper whose name says nothing is instrumented as the shell the host says it is, and
+    /// still spawned as itself: only the arguments and environment are the shell's.
+    /// </summary>
+    [Test]
+    public void A_named_kind_overrides_the_path()
+    {
+        var result = ShellIntegration.Prepare(
+            "/usr/local/bin/my-shell-wrapper", null, new Dictionary<string, string>(), _resources, ShellKind.Zsh);
+
+        Assert.That(result.Injected, Is.True);
+        Assert.That(result.Kind, Is.EqualTo(ShellKind.Zsh));
+        Assert.That(result.Environment["ZDOTDIR"], Is.EqualTo(Path.Combine(_resources, "zsh")));
+    }
+
+    [Test]
+    public void A_named_kind_overrides_a_path_that_names_another_shell()
+    {
+        var result = ShellIntegration.Prepare(
+            "/bin/bash", null, new Dictionary<string, string>(), _resources, ShellKind.Fish);
+
+        Assert.That(result.Kind, Is.EqualTo(ShellKind.Fish));
+        Assert.That(result.Environment, Does.ContainKey("XDG_DATA_DIRS"));
+        Assert.That(result.Environment, Does.Not.ContainKey("ENV"));
+    }
+
+    [Test]
+    public void Unknown_as_the_named_kind_still_detects()
+    {
+        var result = ShellIntegration.Prepare(
+            "/bin/bash", null, new Dictionary<string, string>(), _resources, ShellKind.Unknown);
+
+        Assert.That(result.Kind, Is.EqualTo(ShellKind.Bash));
+    }
+
     // ---- PowerShell -----------------------------------------------------------------------------
 
     /// <summary>
@@ -349,6 +386,14 @@ public class ShellIntegrationTests
     [TestCase("-EncodedCommand", "RwBlAHQALQBEAGEAdABlAA==")]
     [TestCase("-ec", "RwBlAHQALQBEAGEAdABlAA==")]
     [TestCase("-NonInteractive", "")]
+    [TestCase("-comm", "Get-Date")]
+    [TestCase("-COMMAND", "Get-Date")]
+    [TestCase("--command", "Get-Date")]
+    [TestCase("/c", "Get-Date")]
+    [TestCase("-fi", "script.ps1")]
+    [TestCase("--file", "script.ps1")]
+    [TestCase("-enc", "RwBlAHQALQBEAGEAdABlAA==")]
+    [TestCase("-noni", "")]
     public void PowerShell_one_shot_switches_are_left_alone(string option, string value)
     {
         var args = string.IsNullOrEmpty(value) ? new[] { option } : new[] { option, value };
@@ -366,6 +411,38 @@ public class ShellIntegrationTests
     {
         var args = string.IsNullOrEmpty(value) ? new[] { option } : new[] { option, value };
 
+        Assert.That(Prepare("pwsh", args).Injected, Is.True);
+    }
+
+    /// <summary>
+    /// A script named without -File is still a script: pwsh runs it and exits, and the
+    /// -NoExit -Command added after it would reach the script as two arguments of its own.
+    /// </summary>
+    [TestCase("script.ps1")]
+    [TestCase("./script.ps1", "an-argument")]
+    [TestCase("/home/me/script.ps1")]
+    [TestCase("C:\\Users\\me\\script.ps1")]
+    [TestCase("-NoLogo", "script.ps1")]
+    [TestCase("-WorkingDirectory", "/tmp", "script.ps1")]
+    public void PowerShell_with_a_script_named_bare_is_left_alone(params string[] args)
+    {
+        var result = Prepare("pwsh", args);
+
+        Assert.That(result.Injected, Is.False);
+        Assert.That(result.Skipped, Is.EqualTo(SkipReason.NotInteractive));
+        Assert.That(result.Args, Is.EqualTo(args));
+    }
+
+    /// <summary>The value of a switch that takes one is not a script.</summary>
+    [TestCase("-ex", "Bypass")]
+    [TestCase("-ep", "Bypass")]
+    [TestCase("-wd", "C:\\Users\\me")]
+    [TestCase("-WindowStyle", "Maximized")]
+    [TestCase("-OutputFormat", "Text")]
+    [TestCase("-ConfigurationName", "Restricted")]
+    [TestCase("-NoLogo", "-NoProfile", "-Interactive")]
+    public void PowerShell_switch_values_are_not_taken_for_a_script(params string[] args)
+    {
         Assert.That(Prepare("pwsh", args).Injected, Is.True);
     }
 

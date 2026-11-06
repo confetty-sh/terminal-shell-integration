@@ -30,9 +30,7 @@ A shell that emits nothing looks exactly like a shell that was never instrumente
 what arrived rather than passing or failing.
 """
 import os
-import pty
 import re
-import select
 import shutil
 import sys
 import tempfile
@@ -145,6 +143,76 @@ PROMPT_COMMAND='__user_prompt'
 PROMPT_COMMAND=(__user_prompt)
 """,
     }, [], []),
+    # PowerShell scenarios run with -NoProfile, and "profile.ps1" is dot-sourced in the -Command
+    # before the integration -- which is what pwsh does with a real profile, and the only way to
+    # give it a throwaway one on Windows, where the profile lives under Documents and no
+    # environment variable moves it.
+    "pwsh-plain": ("pwsh", {}, [], []),
+    # Native exit codes, a failing cmdlet after a failing native command -- $LASTEXITCODE is still
+    # 3 then, and is not the cmdlet's status -- an exception, and the same native code twice.
+    "pwsh-statuses": ("pwsh", {}, [], [], {"commands": [
+        ("{native-exit 3}", "3"),
+        ("Get-Item /no/such/path-check-shell-integration", "1"),
+        ("$null = 1", "0"),
+        ("throw 'boom'", "1"),
+        ("{native-exit 3}", "3"),
+        ("{native-exit 3}", "3"),
+        ("Write-Error 'oops'", "1"),
+    ]}),
+    # A prompt drawn with Write-Host, as posh-git and many hand-written prompts do, that also
+    # reads $? -- as starship and oh-my-posh do, to colour the prompt after a failure. Write-Host
+    # output goes out while the prompt function runs, before the string it returns, so it must
+    # still land between A and B; and $? must be the user's command's, not the integration's.
+    "pwsh-write-host-prompt": ("pwsh", {
+        "profile.ps1": """function prompt {
+    $ok = $?
+    Write-Host -NoNewline "hook-saw:$(if ($ok) { 0 } else { 1 }) "
+    Write-Host -NoNewline 'user-prompt'
+    return '> '
+}
+""",
+    }, [], ["user-prompt"], {"commands": [
+        ("echo hello", "0"),
+        ("Get-Item /no/such/path-check-shell-integration", "1"),
+    ], "between_ab": ["user-prompt"]}),
+    # A prompt that returns its whole text, reading $? and $LASTEXITCODE the way starship's does.
+    "pwsh-return-prompt": ("pwsh", {
+        "profile.ps1": """function prompt {
+    $ok = $global:?
+    $code = $global:LASTEXITCODE
+    "hook-saw:$(if ($ok) { 0 } else { 1 }) lec=$code user-prompt> "
+}
+""",
+    }, [], ["user-prompt", "lec=3"], {"commands": [
+        ("echo hello", "0"),
+        ("{native-exit 3}", "3"),
+    ], "hooks": ["0", "1"], "between_ab": ["user-prompt"]}),
+    # PSReadLine imported and configured by the profile, so it is already loaded when the
+    # integration runs rather than arriving after it.
+    "pwsh-psreadline-profile": ("pwsh", {
+        "profile.ps1": """Import-Module PSReadLine
+Set-PSReadLineOption -ContinuationPrompt '>>> '
+Set-PSReadLineKeyHandler -Chord Ctrl+g -Function AcceptLine
+""",
+    }, [], []),
+    # Input over several lines: PSReadLine takes Enter on an unfinished statement as a newline
+    # and draws the continuation prompt, so this is one command, one C and one D.
+    "pwsh-multiline": ("pwsh", {}, [], ["multi-ran"], {"commands": [
+        ("if ($true) {\r'multi-' + 'ran'\r}", "0"),
+        ("echo hello", "0"),
+    ]}),
+    # A location outside the filesystem has no directory to report. The last filesystem one is
+    # still where a new tab should open.
+    "pwsh-provider": ("pwsh", {}, [], [], {"commands": [
+        ("Set-Location Env:", "0"),
+        ("Set-Location Function:", "0"),
+    ], "absent_re": [r"\x1b\]7;file://[^/\x07\x1b]*(?:\x07|\x1b\\)",
+                     r"\x1b\]9;9;\"?(?:Env|Function|HKEY)[^\x07]*\x07",
+                     r"\x1b\]9;9;\"\"\x07"]}),
+    # A prompt that throws still gets marked, and the terminal still gets a prompt.
+    "pwsh-throwing-prompt": ("pwsh", {
+        "profile.ps1": "function prompt { throw 'prompt is broken' }\n",
+    }, [], []),
 }
 
 args = sys.argv[1:]
@@ -163,11 +231,16 @@ if "--scenario" in args:
 SHELL = args[0] if args else (SCENARIOS[SCENARIO][0] if SCENARIO else "zsh")
 
 # An explicit binary, for testing a shell the system does not ship as its default —
-# macOS bash is 3.2 from 2007, so a modern one has to be named.
+# macOS bash is 3.2 from 2007, so a modern one has to be named. Windows PowerShell 5.1 is the
+# pwsh scripts run by another binary: `pwsh powershell`.
 BINARY = args[1] if len(args) > 1 else SHELL
 
 if SCENARIO and SCENARIOS[SCENARIO][0] != SHELL:
     sys.exit(f"scenario {SCENARIO} is for {SCENARIOS[SCENARIO][0]}, not {SHELL}")
+
+WINDOWS = os.name == "nt"
+if WINDOWS and SHELL != "pwsh":
+    sys.exit(f"{SHELL} is not run on Windows; only pwsh is")
 
 here = os.path.dirname(os.path.abspath(__file__))
 resources = os.path.join(
@@ -192,7 +265,11 @@ env["TERM"] = "xterm-256color"
 home = None
 required = []
 absent = []
+absent_re = []
+between_ab = []
 extra_args = []
+extras = {}
+files = {}
 if SCENARIO:
     _, files, extra_args, required = SCENARIOS[SCENARIO][:4]
     extras = SCENARIOS[SCENARIO][4] if len(SCENARIOS[SCENARIO]) > 4 else {}
@@ -204,10 +281,29 @@ if SCENARIO:
             f.write(content)
     env["HOME"] = home
     env.pop("ZDOTDIR", None)
+    # Where pwsh on Unix keeps PSReadLine's history, so a run never writes to the real one.
+    env.pop("XDG_DATA_HOME", None)
+    env.pop("XDG_CONFIG_HOME", None)
     for name, value in extras.get("env", {}).items():
         env[name] = value.replace("{HOME}", home)
     required = [r.replace("{HOME}", home) for r in required]
     absent = [a.replace("{HOME}", home) for a in extras.get("absent", [])]
+    absent_re = extras.get("absent_re", [])
+    between_ab = extras.get("between_ab", [])
+
+
+def native_exit(code):
+    """A NATIVE command that exits with `code`, which is what $LASTEXITCODE reports."""
+    return f"cmd /c exit {code}" if WINDOWS else f"sh -c 'exit {code}'"
+
+
+# The commands typed, each with the status its D must carry. Two with different statuses by
+# default, so D can be checked for carrying the right one. Windows has no `false`.
+if "commands" in extras:
+    COMMANDS = [(re.sub(r"\{native-exit (\d+)\}", lambda m: native_exit(m.group(1)), text), status)
+                for text, status in extras["commands"]]
+else:
+    COMMANDS = [("echo hello", "0"), (native_exit(1) if WINDOWS else "false", "1")]
 
 if SHELL == "bash":
     env["TERMINAL_SHELL_BASH_INJECT"] = "login" if "-l" in extra_args else ""
@@ -228,22 +324,94 @@ elif SHELL == "pwsh":
     # -Command runs after the profiles, so the script wraps whatever prompt they installed.
     # -NoLogo keeps the banner out of the capture; -NoExit is what makes it interactive after.
     script = os.path.join(resources, "pwsh", "integration.ps1")
-    argv = [BINARY, "-NoLogo", "-NoExit", "-Command", f". '{script}'"]
+    command = f". '{script}'"
+    profile_args = []
+    if SCENARIO:
+        # A scenario never reads a real profile. Its own, if it has one, is dot-sourced first in
+        # the same -Command: the same scope and the same order as pwsh gives a profile.
+        profile_args = ["-NoProfile"]
+        if "profile.ps1" in files:
+            command = f". '{os.path.join(home, 'profile.ps1')}'; " + command
+    argv = [BINARY, "-NoLogo"] + profile_args + ["-NoExit", "-Command", command]
 else:
     sys.exit(f"unknown shell {SHELL}")
 
-pid, fd = pty.fork()
-if pid == 0:
-    os.execvpe(argv[0], argv, env)
 
-# A real terminal always tells the pty its size; a 0x0 window makes some line editors refuse to
-# initialise, and PSReadLine is one of them.
-import fcntl, struct, termios
-fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+class UnixPty:
+    """The shell on a pty, which is what a terminal gives it."""
+
+    def __init__(self, argv, env):
+        import fcntl, pty, struct, termios
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.execvpe(argv[0], argv, env)
+        # A real terminal always tells the pty its size; a 0x0 window makes some line editors
+        # refuse to initialise, and PSReadLine is one of them.
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+
+    def read(self, timeout):
+        """Bytes if any arrived within `timeout`, b"" if none did, None once the shell is gone."""
+        import select
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return b""
+        try:
+            chunk = os.read(self.fd, 65536)
+        except OSError:
+            return None
+        return chunk or None
+
+    def write(self, data):
+        os.write(self.fd, data)
+
+
+class WindowsPty:
+    """The shell on a ConPTY, through pywinpty (pip install pywinpty).
+
+    pywinpty carries its own conpty.dll and OpenConsole.exe -- the console host Windows Terminal
+    ships -- rather than the one in the system, so this is the console a terminal bundling
+    OpenConsole sees. The text comes back already decoded, and goes out as text.
+    """
+
+    def __init__(self, argv, env):
+        from winpty import PTY
+        program = shutil.which(argv[0], path=env.get("PATH"))
+        if not program:
+            sys.exit(f"{argv[0]} not found on PATH")
+        import subprocess
+        self.pty = PTY(120, 40)
+        block = "\0".join(f"{k}={v}" for k, v in env.items()) + "\0"
+        self.pty.spawn(program, cmdline=" " + subprocess.list2cmdline(argv[1:]), env=block)
+
+    def read(self, timeout):
+        text = self.pty.read(blocking=False)
+        if text:
+            return text.encode("utf-8")
+        if not self.pty.isalive():
+            return None
+        time.sleep(timeout)
+        return b""
+
+    def write(self, data):
+        self.pty.write(data.decode("utf-8"))
+
+
+# On Windows PSReadLine keeps its history under %APPDATA%, which no variable moves, so a run
+# would add its commands to the real one. It is put back as it was afterwards.
+history_file = None
+history_before = None
+if WINDOWS:
+    history_file = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "PowerShell",
+                                "PSReadLine", "ConsoleHost_history.txt")
+    if os.path.exists(history_file):
+        with open(history_file, "rb") as f:
+            history_before = f.read()
+
+shell = WindowsPty(argv, env) if WINDOWS else UnixPty(argv, env)
 
 # Modern shells interrogate the terminal before drawing anything — fish asks for the kitty keyboard
 # flags, the terminal version, the background colour, terminfo capabilities and the device
-# attributes, and then WAITS. A harness that stays silent leaves it blocked before its first prompt,
+# attributes — and then WAITS. A harness that stays silent leaves it blocked before its first prompt,
 # which looks identical to integration that never loaded. So this answers, minimally but plausibly.
 QUERIES = [
     # Answer each query ONCE. PowerShell's console asks where the cursor is (DSR 6, below) on
@@ -263,7 +431,7 @@ QUERIES = [
 ]
 
 
-def pump(fd, seconds, sink):
+def pump(seconds, sink):
     """Read for a while, answering anything the shell asks."""
     end = time.time() + seconds
     while time.time() < end:
@@ -271,20 +439,16 @@ def pump(fd, seconds, sink):
         # reply to its cursor query with a short window, and a reply arriving after it lands in
         # the INPUT buffer as keystrokes -- "1;1R" typed into the command line. So the loop spins
         # tight rather than sleeping.
-        ready, _, _ = select.select([fd], [], [], 0.005)
-        if not ready:
-            continue
-        try:
-            chunk = os.read(fd, 65536)
-        except OSError:
+        chunk = shell.read(0.005)
+        if chunk is None:
             return False
         if not chunk:
-            return False
+            continue
 
         sink.append(chunk)
         for pattern, reply in QUERIES:
             if pattern.search(chunk):
-                os.write(fd, reply)
+                shell.write(reply)
     return True
 
 
@@ -299,11 +463,11 @@ def count(pattern, sink):
     return len(pattern.findall(b"".join(sink)))
 
 
-def pump_until_prompt(fd, seconds, sink, prompts_seen):
+def pump_until_prompt(seconds, sink, prompts_seen):
     """Pump until one more prompt has started (OSC 133;A) and, briefly, for its B."""
     end = time.time() + seconds
     while time.time() < end:
-        if not pump(fd, 0.05, sink):
+        if not pump(0.05, sink):
             return prompts_seen
         seen = count(PROMPT_START, sink)
         if seen > prompts_seen:
@@ -311,46 +475,58 @@ def pump_until_prompt(fd, seconds, sink, prompts_seen):
             # and waiting on it would turn that finding into a ten-second stall.
             settle = time.time() + 1.0
             while time.time() < settle and count(PROMPT_END, sink) < seen:
-                if not pump(fd, 0.05, sink):
+                if not pump(0.05, sink):
                     break
             return seen
     return prompts_seen
 
 
-# Type only once the shell is at a prompt. A fixed startup wait typed the first command into a
-# cold pwsh before PSReadLine was reading -- the first prompt drew and nothing ran after it,
-# which is exactly what a broken script looks like. Pacing on the prompt marks instead is both
-# robust on a slow machine and quick on a fast one; the ceiling is for a shell that never gets there.
-seen = pump_until_prompt(fd, 30.0, chunks, 0)
-pump(fd, 0.3, chunks)   # let the line editor finish initialising behind the prompt
+try:
+    # Type only once the shell is at a prompt. A fixed startup wait typed the first command into a
+    # cold pwsh before PSReadLine was reading -- the first prompt drew and nothing ran after it,
+    # which is exactly what a broken script looks like. Pacing on the prompt marks instead is both
+    # robust on a slow machine and quick on a fast one; the ceiling is for a shell that never gets there.
+    seen = pump_until_prompt(30.0, chunks, 0)
+    pump(0.3, chunks)   # let the line editor finish initialising behind the prompt
 
-# Two commands with different exit statuses, so D can be checked for carrying the right one.
-# CR, not LF: Enter is 0x0D on the wire. The line discipline maps it for bash, zsh and fish, but
-# PSReadLine puts the tty in raw mode and reads keys itself, and LF is Ctrl+J to it -- three
-# commands sent with LF became one line that never ran.
-# A shell that never reached a first prompt will not reach the next ones either.
-ceiling = 10.0 if seen else 1.0
+    # CR, not LF: Enter is 0x0D on the wire. The line discipline maps it for bash, zsh and fish, but
+    # PSReadLine puts the tty in raw mode and reads keys itself, and LF is Ctrl+J to it -- three
+    # commands sent with LF became one line that never ran.
+    # A shell that never reached a first prompt will not reach the next ones either.
+    ceiling = 10.0 if seen else 1.0
 
-# zsh: what the user's session ends up with. The handed-over ZDOTDIR must be gone from the shell
-# and from what its children inherit. Written so the command as typed -- which the terminal
-# echoes -- never contains the text checked for, only its output does. First, so the two
-# commands below are still the last two the user hooks see.
-probe = SHELL == "zsh"
-if probe:
-    os.write(fd, b"print -r -- \"probe zdotdir=${ZDOTDIR-unset} helper=${TERMINAL_SHELL_ZDOTDIR-gone}"
-                 b" child=$(env | grep -c '^TERMINAL_SHELL_ZDOTDIR=')\"\r")
-    seen = pump_until_prompt(fd, ceiling, chunks, seen)
-    required.append("helper=gone child=0")
+    # zsh: what the user's session ends up with. The handed-over ZDOTDIR must be gone from the shell
+    # and from what its children inherit. Written so the command as typed -- which the terminal
+    # echoes -- never contains the text checked for, only its output does. First, so the two
+    # commands below are still the last two the user hooks see.
+    probe = SHELL == "zsh"
+    if probe:
+        shell.write(b"print -r -- \"probe zdotdir=${ZDOTDIR-unset} helper=${TERMINAL_SHELL_ZDOTDIR-gone}"
+                    b" child=$(env | grep -c '^TERMINAL_SHELL_ZDOTDIR=')\"\r")
+        seen = pump_until_prompt(ceiling, chunks, seen)
+        required.append("helper=gone child=0")
 
-os.write(fd, b"echo hello\r")
-seen = pump_until_prompt(fd, ceiling, chunks, seen)
-os.write(fd, b"false\r")
-seen = pump_until_prompt(fd, ceiling, chunks, seen)
-# Everything up to here is what the verdict is on. What follows `exit` is the shell leaving -- fish
-# reports a D for the exit command itself -- and is shown, not judged.
-judged = len(b"".join(chunks))
-os.write(fd, b"exit\r")
-pump(fd, 1.5, chunks)
+    for text, _ in COMMANDS:
+        # A command over several lines is typed a line at a time, as a person would, so the line
+        # editor sees each Enter on its own.
+        lines = text.split("\r")
+        for line in lines[:-1]:
+            shell.write(line.encode("utf-8") + b"\r")
+            pump(0.3, chunks)
+        shell.write(lines[-1].encode("utf-8") + b"\r")
+        seen = pump_until_prompt(ceiling, chunks, seen)
+    # Everything up to here is what the verdict is on. What follows `exit` is the shell leaving -- fish
+    # reports a D for the exit command itself -- and is shown, not judged.
+    judged = len(b"".join(chunks))
+    shell.write(b"exit\r")
+    pump(1.5, chunks)
+finally:
+    if history_file and os.path.exists(history_file):
+        if history_before is None:
+            os.remove(history_file)
+        else:
+            with open(history_file, "wb") as f:
+                f.write(history_before)
 
 out = b"".join(chunks)
 text = out.decode("utf-8", "replace")
@@ -396,15 +572,15 @@ statuses = [m[1] for m in judged_marks if m[0] == "D"]
 starts = sum(1 for m in judged_marks if m[0] == "A")
 ends = sum(1 for m in judged_marks if m[0] == "B")
 commands = sum(1 for m in judged_marks if m[0] == "C")
+# The probe, when there is one, runs first and succeeds.
+expected_statuses = (["0"] if probe else []) + [status for _, status in COMMANDS]
 print(f"all four marks present; exit statuses reported: {', '.join(statuses)}")
-print("expected " + ("0 for the probe, then " if SHELL == "zsh" else "") + "0 then 1, since the last command was `false`")
+print(f"expected {', '.join(expected_statuses)}, one for each command typed")
 print(f"prompts  : {starts} started (A), {ends} ended (B); {commands} commands started (C)")
 
 failures = []
-# The verdict CI runs on: every mark, the two statuses in order, a B for every prompt -- a theme
+# The verdict CI runs on: every mark, the statuses in order, a B for every prompt -- a theme
 # that rebuilds the prompt drops one appended at startup -- and a directory report.
-# The probe, when there is one, runs first and succeeds.
-expected_statuses = (["0"] if probe else []) + ["0", "1"]
 if statuses != expected_statuses:
     failures.append(f"statuses not {', '.join(expected_statuses)}")
 # Exactly one of each: the first prompt and one after each command get an A and a B, each command
@@ -423,8 +599,9 @@ if not cwd:
 hooks = re.findall(r"hook-saw:(\d+)", text)
 if hooks:
     print("user hook saw:", " ".join(hooks))
-    # The last two prompts follow `echo hello` and `false`.
-    if hooks[-2:] != ["0", "1"]:
+    # The last prompts follow the commands typed, and a hook reports what each one left behind.
+    expected_hooks = extras.get("hooks", expected_statuses)
+    if hooks[-len(expected_hooks):] != expected_hooks:
         failures.append("the user's own hook saw the wrong $?")
 for needle in required:
     found = needle in text
@@ -436,6 +613,28 @@ for needle in absent:
     print(f"{'PRESENT' if found else 'absent '}  {needle}")
     if found:
         failures.append(f"unexpected {needle!r}")
+for pattern in absent_re:
+    found = re.search(pattern, text)
+    print(f"{'PRESENT' if found else 'absent '}  /{pattern}/" + (f"  {found.group(0)!r}" if found else ""))
+    if found:
+        failures.append(f"unexpected /{pattern}/")
+# Text the prompt draws must sit inside the prompt: after its A, before its B. Write-Host output
+# goes out while the prompt function runs, ahead of the string it returns, so marks carried only
+# in that string end up after the prompt they are meant to bracket.
+for needle in between_ab:
+    events = sorted([(m.start(), "A") for m in re.finditer(r"\x1b\]133;A", judged_text)]
+                    + [(m.start(), "B") for m in re.finditer(r"\x1b\]133;B", judged_text)]
+                    + [(m.start(), "N") for m in re.finditer(re.escape(needle), judged_text)])
+    last, outside = None, 0
+    for _, kind in events:
+        if kind == "N":
+            outside += last != "A"
+        else:
+            last = kind
+    print(f"{'inside ' if not outside else 'OUTSIDE'}  {needle} between A and B"
+          + (f" ({outside} not)" if outside else ""))
+    if outside:
+        failures.append(f"{needle!r} drawn outside its prompt's A and B")
 
 if failures:
     print("FAIL: " + "; ".join(failures))

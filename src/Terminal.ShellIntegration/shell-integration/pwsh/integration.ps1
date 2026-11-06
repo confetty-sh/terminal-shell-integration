@@ -18,6 +18,9 @@ $Global:__TerminalIntegration = @{
     OriginalReadLine = $null
     CommandRunning   = $false
     LastHistoryId    = -1    # -1 until the first prompt has seen where history stands
+    ReadLineReturned = $true # false while PSReadLine is still reading the line its prompt drew
+    ExitCodeBefore   = $null # $LASTEXITCODE, and the newest error, as they stood when the
+    ErrorBefore      = $null # command began: what decides which of the two its failure was
 }
 
 function Global:__Terminal-Osc([string] $Body) {
@@ -25,7 +28,11 @@ function Global:__Terminal-Osc([string] $Body) {
 }
 
 function Global:__Terminal-ReportCwd {
-    $location = $ExecutionContext.SessionState.Path.CurrentLocation.ProviderPath
+    # The FILESYSTEM location, not the current one. In Env:, Function: or HKLM: there is no
+    # directory -- ProviderPath is empty, or a registry key -- and the last real directory is still
+    # where a new tab should open.
+    $location = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+    if ([string]::IsNullOrEmpty($location)) { return '' }
 
     # $IsWindows is 7-only; on 5.1 it is simply absent, and $env:OS is the older tell.
     if ($IsWindows -or $env:OS -eq 'Windows_NT') {
@@ -53,13 +60,47 @@ function Global:__Terminal-InstallReadLineHook {
     $state.OriginalReadLine = $existing.ScriptBlock
 
     function Global:PSConsoleHostReadLine {
-        $line = & $Global:__TerminalIntegration.OriginalReadLine
+        $state = $Global:__TerminalIntegration
+        $state.ReadLineReturned = $false
+        try {
+            $line = & $state.OriginalReadLine
+        } finally {
+            # Even when reading was cut short, so the next prompt is known for a new one.
+            $state.ReadLineReturned = $true
+        }
         if (-not [string]::IsNullOrWhiteSpace($line)) {
-            $Global:__TerminalIntegration.CommandRunning = $true
+            $state.CommandRunning = $true
+            __Terminal-RememberBefore
             [Console]::Write((__Terminal-Osc '133;C'))
         }
         return $line
     }
+}
+
+# Where $LASTEXITCODE and the error list stand before a command, so that afterwards it can be told
+# which of them its failure came from. $LASTEXITCODE is the code of the last NATIVE command and is
+# left alone by everything else, so after `git` fails with 3 a failing cmdlet still finds 3 there.
+function Global:__Terminal-RememberBefore {
+    $state = $Global:__TerminalIntegration
+    $state.ExitCodeBefore = $Global:LASTEXITCODE
+    $state.ErrorBefore = $null
+    if ($Global:Error.Count -gt 0) { $state.ErrorBefore = $Global:Error[0] }
+}
+
+# The status for D, from $? and $LASTEXITCODE as the command left them.
+function Global:__Terminal-ExitCode([bool] $Succeeded, $LastExit) {
+    if ($Succeeded) { return 0 }
+    if (-not (($LastExit -is [int]) -and ($LastExit -ne 0))) { return 1 }
+
+    # A native command ran if it moved $LASTEXITCODE. When it did not move, the failure is still
+    # the native one unless PowerShell recorded an error of its own -- a cmdlet, a throw -- which
+    # it does for everything but a native command. Compared by identity: the list stops growing
+    # at $MaximumErrorCount, so its length would stop saying anything.
+    $state = $Global:__TerminalIntegration
+    $newError = ($Global:Error.Count -gt 0) -and
+        (-not [object]::ReferenceEquals($Global:Error[0], $state.ErrorBefore))
+    if (($LastExit -ne $state.ExitCodeBefore) -or (-not $newError)) { return $LastExit }
+    return 1
 }
 
 function Global:prompt {
@@ -70,6 +111,15 @@ function Global:prompt {
     $lastExit = $LASTEXITCODE
 
     $state = $Global:__TerminalIntegration
+
+    # PSReadLine draws the prompt again while it is still reading the line -- input over several
+    # lines, InvokePrompt from a key handler, a transient prompt. That is the same prompt redrawn,
+    # not a new one, so it gets no marks: zsh's reset-prompt does not rerun precmd either. Only
+    # once the hook is in, since without PSReadLine there is no reading to be in the middle of.
+    if (($null -ne $state.OriginalReadLine) -and -not $state.ReadLineReturned) {
+        return (__Terminal-UserPrompt $succeeded)
+    }
+
     $out = ''
 
     # PSReadLine loads AFTER -Command finishes and interactive mode begins, so it was not there
@@ -91,11 +141,7 @@ function Global:prompt {
     }
 
     if ($state.CommandRunning -or $historyAdvanced) {
-        $code = 0
-        if (-not $succeeded) {
-            if (($lastExit -is [int]) -and ($lastExit -ne 0)) { $code = $lastExit } else { $code = 1 }
-        }
-        $out += __Terminal-Osc "133;D;$code"
+        $out += __Terminal-Osc "133;D;$(__Terminal-ExitCode $succeeded $lastExit)"
         $state.CommandRunning = $false
     }
 
@@ -104,15 +150,34 @@ function Global:prompt {
     $out += __Terminal-ReportCwd
     $out += __Terminal-Osc '133;A'
 
-    # The user's own prompt, whatever installed it. A ScriptBlock invoked returns a collection,
-    # hence the join. If there was no prompt function at all, draw PowerShell's default.
-    $original = $state.OriginalPrompt
-    if ($null -ne $original) {
-        $out += ((& $original) -join '')
-    } else {
-        $out += "PS $($ExecutionContext.SessionState.Path.CurrentLocation)$('>' * ($NestedPromptLevel + 1)) "
-    }
+    # Written now rather than returned with the prompt. A prompt drawn with Write-Host -- posh-git,
+    # and a great many hand-written ones -- is on the screen before its function returns, so marks
+    # that rode in the returned string came after the prompt they were meant to open.
+    [Console]::Write($out)
 
-    $out += __Terminal-Osc '133;B'
-    return $out
+    $prompt = __Terminal-UserPrompt $succeeded
+
+    # Without PSReadLine, the next command is whatever runs before the next prompt.
+    if ($null -eq $state.OriginalReadLine) { __Terminal-RememberBefore }
+
+    return $prompt + (__Terminal-Osc '133;B')
+}
+
+# The user's own prompt, whatever installed it, seeing the $? their command left: starship and
+# oh-my-posh read it to colour the prompt after a failure, and by now it says only that this
+# script's own statements succeeded. It cannot be assigned, but a statement that fails sets it, and
+# with -ErrorAction Ignore that one is recorded nowhere.
+function Global:__Terminal-UserPrompt([bool] $Succeeded) {
+    $original = $Global:__TerminalIntegration.OriginalPrompt
+    if ($null -ne $original) {
+        try {
+            # A ScriptBlock invoked returns a collection, hence the join.
+            if (-not $Succeeded) { Write-Error '' -ErrorAction Ignore }
+            return ((& $original) -join '')
+        } catch {
+            # A prompt that throws would take the marks down with it. PowerShell draws its
+            # default in that case, and so does this.
+        }
+    }
+    return "PS $($ExecutionContext.SessionState.Path.CurrentLocation)$('>' * ($NestedPromptLevel + 1)) "
 }
