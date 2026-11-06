@@ -259,6 +259,19 @@ _SEND = "-o SendEnv=COLORTERM -o SendEnv=TERM_PROGRAM -o SendEnv=TERM_PROGRAM_VE
 _CURSORS = [r"\x1b\[[0-6] q"]
 
 
+# Each command typed, and the argv the sudo shim must see for it.
+_SUDO_CASES = [
+    ("sudo -u root true", "--preserve-env=TERMINFO -u root true"),
+    ("sudo -e /etc/hosts", "-e /etc/hosts"),
+    ("sudo ls -e", "--preserve-env=TERMINFO ls -e"),
+    ("sudo -u root -e /etc/hosts", "-u root -e /etc/hosts"),
+    ("sudo --user root --edit /etc/hosts", "--user root --edit /etc/hosts"),
+    ("sudo -iu root ls -e", "--preserve-env=TERMINFO -iu root ls -e"),
+    ("sudo -uroot -e /etc/hosts", "-uroot -e /etc/hosts"),
+    ("sudo -Ee /etc/hosts", "-Ee /etc/hosts"),
+]
+
+
 def _term_after(shell):
     return 'echo "term-after=$env:TERM"' if shell == "pwsh" else 'echo "term-after=$TERM"'
 
@@ -282,12 +295,12 @@ def _feature_scenarios(shell):
             "required_re": [r"\x1b\]2;~\x07", r"\x1b\]2;echo title-probe\x07"],
             "absent_re": _CURSORS}),
         # sudo keeps TERMINFO, except for sudoedit; an -e after the command is the command's own.
-        f"{shell}-sudo": (shell, {}, [], [
-            "argv=--preserve-env=TERMINFO -u root true", "argv=-e /etc/hosts",
-            "argv=--preserve-env=TERMINFO ls -e"], {
+        # An option's value is not the command, so -e after `-u root` is still sudoedit -- and
+        # run-together short options are read a letter at a time.
+        f"{shell}-sudo": (shell, {}, [], [f"argv={a}" for _, a in _SUDO_CASES], {
             "features": "sudo", "terminfo": True, "shims": ["sudo"],
-            "commands": [(sudo, "0"), ("sudo -e /etc/hosts", "0"), ("sudo ls -e", "0")],
-            "windows": {"required": ["argv=-u root true", "argv=-e /etc/hosts", "argv=ls -e"],
+            "commands": [(c, "0") for c, _ in _SUDO_CASES],
+            "windows": {"required": [f"argv={c[5:]}" for c, _ in _SUDO_CASES],
                         "absent": ["--preserve-env"]}}),
         # Without a TERMINFO there is nothing to keep, and with the feature off nothing is wrapped.
         f"{shell}-sudo-no-terminfo": (shell, {}, [], ["argv=-u root true"], {

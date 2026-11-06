@@ -129,12 +129,41 @@ function __terminal_wrap_commands --on-event fish_prompt --description 'wrap sud
     if contains sudo $__terminal_features; and test -n "$TERMINFO"
         and test (type -t sudo 2>/dev/null; or echo none) = file
         function sudo --wraps sudo --description 'sudo, keeping TERMINFO'
+            set -l skip 0
             for arg in $argv
+                if test $skip = 1
+                    set skip 0
+                    continue
+                end
                 switch $arg
                     case -e --edit
                         command sudo $argv
                         return
-                    case '-*' '*=*'
+                    case --close-from --chdir --group --prompt --chroot --role --command-timeout --type --other-user --user
+                        set skip 1 # its value is the next argument
+                    case --
+                        break
+                    case '--*'
+                    case -
+                        break # not an option: fish 4 has no ? wildcard, so a lone - goes first
+                    case '-*'
+                        # Short options, alone or run together: -E, -iu root, -uroot. A letter
+                        # that takes a value takes the rest of the run, or the next argument when
+                        # it is the last.
+                        set -l letters (string sub -s 2 -- $arg)
+                        while test -n "$letters"
+                            set -l letter (string sub -l 1 -- $letters)
+                            set letters (string sub -s 2 -- $letters)
+                            if test "$letter" = e
+                                command sudo $argv
+                                return
+                            end
+                            if string match -q -r '^[CDgpRrTtUu]$' -- $letter
+                                test -z "$letters"; and set skip 1
+                                break
+                            end
+                        end
+                    case '*=*'
                     case '*'
                         break # the command sudo is to run; what follows is its own
                 end

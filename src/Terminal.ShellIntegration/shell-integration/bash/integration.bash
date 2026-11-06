@@ -231,11 +231,28 @@ __terminal_plain_command() { [[ "$(builtin type -t "$1" 2>/dev/null)" == file ]]
 # --edit) is left alone, since it never runs a program on this terminal.
 if __terminal_feature sudo && [[ -n "${TERMINFO:-}" ]] && __terminal_plain_command sudo; then
   sudo() {
-    local arg
+    local arg letters letter skip=0
     for arg in "$@"; do
+      if (( skip )); then skip=0; continue; fi
       case "$arg" in
         -e|--edit) builtin command sudo "$@"; return ;;
-        -*|*=*) ;;
+        --close-from|--chdir|--group|--prompt|--chroot|--role|--command-timeout|--type|--other-user|--user)
+          skip=1 ;;  # its value is the next argument
+        --) break ;;
+        --*) ;;
+        -?*)
+          # Short options, alone or run together: -E, -iu root, -uroot. A letter that takes a value
+          # takes the rest of the run, or the next argument when it is the last.
+          letters="${arg#-}"
+          while [[ -n "$letters" ]]; do
+            letter="${letters:0:1}"
+            letters="${letters:1}"
+            case "$letter" in
+              e) builtin command sudo "$@"; return ;;
+              [CDgpRrTtUu]) [[ -z "$letters" ]] && skip=1; break ;;
+            esac
+          done ;;
+        *=*) ;;
         *) break ;;  # the command sudo is to run; what follows is its own
       esac
     done
