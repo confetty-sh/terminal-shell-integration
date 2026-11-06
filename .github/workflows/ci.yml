@@ -92,6 +92,10 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --quiet pywinpty
+          # The versions the README's verification line names.
+          foreach ($binary in 'pwsh', 'powershell') {
+            & $binary -NoProfile -Command '"$($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion), PSReadLine $((Get-Module -ListAvailable PSReadLine | Sort-Object Version -Descending | Select-Object -First 1).Version), on $([Environment]::OSVersion.VersionString)"'
+          }
           $scenarios = python tools/check-shell-integration.py --list | ForEach-Object { $f = -split $_; if ($f[1] -eq 'pwsh') { $f[0] } }
           foreach ($binary in 'pwsh', 'powershell') {
             foreach ($s in $scenarios) {
