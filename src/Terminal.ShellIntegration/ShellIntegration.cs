@@ -99,13 +99,31 @@ public static class ShellIntegration
         IReadOnlyList<string>? args,
         IReadOnlyDictionary<string, string>? environment,
         string resourcesDirectory)
+        => Prepare(shellPath, args, environment, resourcesDirectory, ShellKind.Unknown);
+
+    /// <summary>
+    /// The same, with the shell named by the host rather than worked out from its path.
+    /// </summary>
+    /// <remarks>
+    /// For a shell reached through something whose name says nothing -- a wrapper script, a
+    /// renamed binary -- where the user has said which shell it is, as Ghostty's
+    /// <c>shell-integration = zsh</c> does. <see cref="ShellKind.Unknown"/> means work it out from
+    /// the path, as the overload without it does.
+    /// </remarks>
+    public static ShellIntegrationResult Prepare(
+        string shellPath,
+        IReadOnlyList<string>? args,
+        IReadOnlyDictionary<string, string>? environment,
+        string resourcesDirectory,
+        ShellKind kind)
     {
         var originalArgs = args is null ? new List<string>() : new List<string>(args);
         var env = environment is null
             ? new Dictionary<string, string>(StringComparer.Ordinal)
             : new Dictionary<string, string>(environment, StringComparer.Ordinal);
 
-        var kind = Identify(shellPath);
+        if (kind == ShellKind.Unknown)
+            kind = Identify(shellPath);
 
         if (kind == ShellKind.Unknown)
             return new(originalArgs, env, kind, false, SkipReason.UnsupportedShell);
@@ -199,33 +217,81 @@ public static class ShellIntegration
     }
 
     /// <summary>
-    /// PowerShell's one-shot switches.
+    /// PowerShell's one-shot switches, and a script named without one.
     /// </summary>
     /// <remarks>
-    /// PowerShell uses single-dash long options, case-insensitive, and accepts unambiguous prefixes
-    /// of them -- so the POSIX test above would be wrong in both directions: <c>-ExecutionPolicy</c>
-    /// contains a <c>c</c> and is interactive, while <c>-File</c> contains none and is not. The
-    /// spellings here are the documented aliases; a bare <c>-e</c> is <c>-EncodedCommand</c>.
+    /// <para>PowerShell uses single-dash long options, case-insensitive, and accepts any prefix of
+    /// one down to its shortest unambiguous spelling -- <c>-comm</c> is <c>-Command</c>, <c>-fi</c>
+    /// is <c>-File</c> -- as well as <c>--</c> and, on Windows, <c>/</c> in front. So the POSIX
+    /// test above would be wrong in both directions: <c>-ExecutionPolicy</c> contains a <c>c</c>
+    /// and is interactive, while <c>-File</c> contains none and is not. A bare <c>-e</c> is
+    /// <c>-EncodedCommand</c>.</para>
+    /// <para>An argument that is not a switch, nor the value of one, is a script: pwsh takes it
+    /// as <c>-File</c> and Windows PowerShell as <c>-Command</c>. Either way the shell runs it and
+    /// exits, and the arguments added after it would be handed to the script as its own.</para>
     /// </remarks>
     private static bool IsNonInteractivePowerShell(IReadOnlyList<string> args)
     {
-        foreach (var arg in args)
+        for (var i = 0; i < args.Count; i++)
         {
-            if (arg.Length < 2 || arg[0] != '-')
-                continue;
+            var name = PowerShellSwitch(args[i]);
+            if (name is null)
+                return true;
 
-            switch (arg[1..].ToLowerInvariant())
-            {
-                case "command": case "c":
-                case "file": case "f":
-                case "encodedcommand": case "ec": case "enc": case "e":
-                case "noninteractive":
-                    return true;
-            }
+            if (Abbreviates(name, "command", 1) || Abbreviates(name, "file", 1)
+                || Abbreviates(name, "encodedcommand", 1) || name == "ec"
+                || Abbreviates(name, "noninteractive", 4))
+                return true;
+
+            if (PowerShellSwitchTakesValue(name))
+                i++;
         }
 
         return false;
     }
+
+    /// <summary>The switch an argument names, lower-cased, or null when it is not a switch.</summary>
+    /// <remarks>
+    /// Names are letters only, so <c>/home/me/x.ps1</c> -- which starts like a Windows switch --
+    /// and <c>-</c> on its own are arguments, not switches.
+    /// </remarks>
+    private static string? PowerShellSwitch(string arg)
+    {
+        string name;
+        if (arg.StartsWith("--", StringComparison.Ordinal)) name = arg[2..];
+        else if (arg.StartsWith('-') || arg.StartsWith('/')) name = arg[1..];
+        else return null;
+
+        if (name.Length == 0)
+            return null;
+        foreach (var c in name)
+        {
+            if (!char.IsAsciiLetter(c) && c != '?')
+                return null;
+        }
+
+        return name.ToLowerInvariant();
+    }
+
+    /// <summary>Whether <paramref name="name"/> is a spelling PowerShell accepts for <paramref name="full"/>.</summary>
+    private static bool Abbreviates(string name, string full, int shortest) =>
+        name.Length >= shortest && full.StartsWith(name, StringComparison.Ordinal);
+
+    /// <summary>
+    /// The switches followed by a value, so that value is not taken for a script. One missing here
+    /// errs safe: its value reads as a script, and the shell is left uninstrumented rather than
+    /// broken.
+    /// </summary>
+    private static bool PowerShellSwitchTakesValue(string name) =>
+        name.StartsWith("config", StringComparison.Ordinal)        // -ConfigurationName, -ConfigurationFile
+        || Abbreviates(name, "custompipename", 3)
+        || Abbreviates(name, "executionpolicy", 2) || name == "ep"
+        || Abbreviates(name, "inputformat", 2) || name == "if"
+        || Abbreviates(name, "outputformat", 1) || name == "of"
+        || Abbreviates(name, "settingsfile", 8)
+        || name.StartsWith('w')                                     // -WindowStyle, -WorkingDirectory, -wd
+        || Abbreviates(name, "psconsolefile", 3)                    // Windows PowerShell
+        || name == "version";                                       // Windows PowerShell: -Version 2.0
 
     /// <summary>
     /// PowerShell, via <c>-NoExit -Command</c>.
